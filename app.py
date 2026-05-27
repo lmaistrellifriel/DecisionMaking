@@ -966,26 +966,45 @@ with cB:
 
 st.plotly_chart(plot_expected_production(df_view, wind_cols), use_container_width=True)
 
+
 # =============================
-# STIMA TEMPO
+# STIMA TEMPO + RUN CONTROL
 # =============================
+
+# ✅ ricalcola sempre con dati aggiornati
 n_days = len(feasible_days)
 n_members_used = len(wind_cols)
-total_work_h = sum(s.duration_h for s in steps)
+total_work_h = float(sum(s.duration_h for s in steps)) if len(steps) > 0 else 0
 
-# stima empirica
-complexity = n_days * n_members_used * total_work_h * 2.5
-estimated_seconds = complexity / 60000
+# ✅ evitare divisioni strane
+if n_days > 0 and n_members_used > 0 and total_work_h > 0:
+    complexity = n_days * n_members_used * total_work_h * 2.5
+    estimated_seconds = complexity / 60000
+else:
+    estimated_seconds = 0
 
-col_run1, col_run2 = st.columns([1,2])
+# ✅ layout corretto (vicini davvero)
+col_run1, col_run2 = st.columns([1,1])
 
+with col_run1:
+    run_simulation = st.button(
+        "▶️ Esegui simulazione",
+        type="primary",
+        key="run_simulation_button"
+    )
 
 with col_run2:
-    if estimated_seconds < 1:
-        st.info("⏱️ Tempo stimato: <1 secondo")
-    else:
+    if estimated_seconds == 0:
+        st.info("⏱️ Tempo stimato: n.d.")
+    elif estimated_seconds < 1:
+        st.info("⏱️ Tempo stimato: <1 s")
+    elif estimated_seconds < 60:
         st.info(f"⏱️ Tempo stimato: ~{estimated_seconds:.1f} s")
+    else:
+        st.info(f"⏱️ Tempo stimato: ~{estimated_seconds/60:.1f} min")
 
+
+# =============================
 
 
 # Run simulations
@@ -1014,10 +1033,6 @@ if run_simulation:
                 params=params,
                 rated_mw=2.0,
             )
-
-    summary = compute_daily_summary(sims)
-    summary = add_confidence(summary)
-    best_day, scored = choose_optimal_day(summary, risk_aversion=risk_aversion)
 
 else:
     st.info("👉 Premi 'Esegui simulazione' per calcolare i risultati.")
