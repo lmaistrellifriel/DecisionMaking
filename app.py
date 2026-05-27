@@ -979,8 +979,6 @@ estimated_seconds = complexity / 60000
 
 col_run1, col_run2 = st.columns([1,2])
 
-with col_run1:
-    run_simulation = st.button("▶️ Esegui simulazione", type="primary")
 
 with col_run2:
     if estimated_seconds < 1:
@@ -993,7 +991,13 @@ with col_run2:
 # Run simulations
 st.subheader("Risultati per giorno di inizio (D0)")
 
-run_simulation = st.button("▶️ Esegui simulazione", type="primary")
+
+run_simulation = st.button(
+    "▶️ Esegui simulazione",
+    type="primary",
+    key="run_simulation_button"
+)
+
 
 sims = {}
 
