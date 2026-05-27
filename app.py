@@ -92,7 +92,7 @@ def generate_mock_open_meteo_ensemble(
     Uncertainty increases after day 3.
     """
     rng = np.random.default_rng(seed)
-    idx = pd.date_range(start=start, periods=days * 24, freq="1h") ``
+    idx = pd.date_range(start=start, periods=days * 24, freq="1h")
     df = pd.DataFrame({"timestamp": idx})
     df["latitude"] = latitude
     df["longitude"] = longitude
