@@ -1,10 +1,12 @@
 import math
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 
@@ -22,25 +24,24 @@ st.set_page_config(
 # UTILITIES
 # -----------------------------
 def to_time(hhmm: str):
-    """Parse HH:MM -> datetime.time"""
     return pd.to_datetime(hhmm, format="%H:%M").time()
 
 
 def is_weekend(ts: pd.Timestamp) -> bool:
-    return ts.weekday() >= 5  # 5=Sat, 6=Sun
+    return ts.weekday() >= 5
 
 
 def in_work_shift(ts: pd.Timestamp, shift_start: str, shift_end: str) -> bool:
-    """
-    Work shift defined within the same calendar day.
-    Assumes shift_start < shift_end (e.g. 07:00 to 18:00).
-    """
     t = ts.time()
     return (t >= to_time(shift_start)) and (t < to_time(shift_end))
 
 
-def shift_end_timestamp(ts: pd.Timestamp, shift_end: str) -> pd.Timestamp:
-    return pd.Timestamp(ts.date()) + pd.to_timedelta(f"{shift_end}:00")
+def shift_start_timestamp(day: pd.Timestamp, shift_start: str) -> pd.Timestamp:
+    return pd.Timestamp(day.date()) + pd.to_timedelta(f"{shift_start}:00")
+
+
+def shift_end_timestamp(day: pd.Timestamp, shift_end: str) -> pd.Timestamp:
+    return pd.Timestamp(day.date()) + pd.to_timedelta(f"{shift_end}:00")
 
 
 def safe_percentile(a: np.ndarray, q: float) -> float:
@@ -48,6 +49,14 @@ def safe_percentile(a: np.ndarray, q: float) -> float:
     if len(a) == 0:
         return np.nan
     return float(np.percentile(a, q))
+
+
+def clamp_date_to_forecast(d: pd.Timestamp, forecast_start: pd.Timestamp, forecast_end: pd.Timestamp) -> pd.Timestamp:
+    if d < forecast_start:
+        return forecast_start.normalize()
+    if d > forecast_end:
+        return forecast_end.normalize()
+    return d.normalize()
 
 
 # -----------------------------
@@ -60,13 +69,6 @@ def power_curve_mw(
     rated: float = 12.0,
     cut_out: float = 25.0,
 ) -> float:
-    """
-    Simple generic curve:
-    - 0 below cut-in
-    - cubic ramp to rated
-    - constant rated to cut-out
-    - 0 above cut-out
-    """
     if wind_ms is None or (isinstance(wind_ms, float) and np.isnan(wind_ms)):
         return 0.0
     w = float(wind_ms)
@@ -104,44 +106,23 @@ def plot_power_curve(
         xaxis_title="Wind speed [m/s]",
         yaxis_title="Power [MW]",
         template="plotly_white",
-        height=360,
+        height=340,
         margin=dict(l=10, r=10, t=55, b=10),
     )
     return fig
 
 
 # -----------------------------
-# MOCK DATA GENERATION
+# PRICES (mock if not provided)
 # -----------------------------
-def generate_mock_open_meteo_ensemble(
-    start: str = "2026-03-09 00:00",
-    days: int = 10,
-    n_members: int = 10,
-    seed: int = 42,
-    include_gusts: bool = True,
-    latitude: float = 41.5,
-    longitude: float = 15.2,
-) -> pd.DataFrame:
+def generate_price_series(ts: pd.Series, seed: int = 7) -> np.ndarray:
     """
-    Produce an hourly dataset shaped like an Open-Meteo ensemble export:
-    - timestamp
-    - price_eur_mwh (mock intraday shape ~60-120 €/MWh)
-    - wind_speed_80m_member_{i}
-    - optional wind_gusts_10m_member_{i}
-    Uncertainty increases after day 3.
+    Demo price curve 60-120 €/MWh with intraday shape.
+    Used when you don't load/compute real prices elsewhere.
     """
     rng = np.random.default_rng(seed)
-
-    # IMPORTANT: use "1h" not "H" for max compatibility
-    idx = pd.date_range(start=pd.to_datetime(start), periods=int(days * 24), freq="1h")
-
-    df = pd.DataFrame({"timestamp": idx})
-    df["latitude"] = latitude
-    df["longitude"] = longitude
-
-    # Price profile: realistic intraday shape 60-120 €/MWh (demo only)
-    hour = df["timestamp"].dt.hour.values
-    dow = df["timestamp"].dt.dayofweek.values
+    hour = ts.dt.hour.values
+    dow = ts.dt.dayofweek.values
 
     base = (
         70
@@ -150,11 +131,115 @@ def generate_mock_open_meteo_ensemble(
         + 10 * np.exp(-((hour - 9) ** 2) / (2 * 2.8**2))
     )
     weekend_factor = np.where(dow >= 5, -7, 0)
-    noise = rng.normal(0, 3.0, size=len(df))
+    noise = rng.normal(0, 3.0, size=len(ts))
     price = np.clip(base + weekend_factor + noise, 60, 120)
-    df["price_eur_mwh"] = np.round(price, 2)
+    return np.round(price, 2)
 
-    # Wind baseline
+
+# -----------------------------
+# OPEN-METEO: FETCH ENSEMBLE
+# -----------------------------
+OPEN_METEO_ENSEMBLE_ENDPOINT = "https://ensemble-api.open-meteo.com/v1/ensemble"
+
+
+def _extract_member_cols(hourly: dict, base_name: str) -> List[str]:
+    """
+    Robustly detect keys like:
+      - wind_speed_80m_member_0
+      - wind_speed_80m_member0
+      - wind_speed_80m_member 0
+    Returns ordered list by member index.
+    """
+    keys = list(hourly.keys())
+    patt = re.compile(rf"^{re.escape(base_name)}_?member[\s_]?(\d+)$")
+    found = []
+    for k in keys:
+        m = patt.match(k)
+        if m:
+            found.append((int(m.group(1)), k))
+    found.sort(key=lambda x: x[0])
+    return [k for _, k in found]
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 30)
+def fetch_open_meteo_ensemble(
+    latitude: float,
+    longitude: float,
+    model: str,
+    forecast_days: int,
+    include_gusts: bool,
+    timezone: str = "auto",
+) -> pd.DataFrame:
+    """
+    Fetch ensemble forecast from Open-Meteo.
+    We request wind_speed_80m and (optional) wind_gusts_10m.
+    Forecast length up to 16 days per docs. 【1-2f3670】
+    """
+    hourly_vars = ["wind_speed_80m"]
+    if include_gusts:
+        hourly_vars.append("wind_gusts_10m")
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "models": model,
+        "forecast_days": int(forecast_days),
+        "hourly": ",".join(hourly_vars),
+        "timezone": timezone,
+    }
+
+    r = requests.get(OPEN_METEO_ENSEMBLE_ENDPOINT, params=params, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+
+    if "hourly" not in js or "time" not in js["hourly"]:
+        raise ValueError("Risposta Open-Meteo non contiene il blocco 'hourly.time'.")
+
+    hourly = js["hourly"]
+    times = pd.to_datetime(hourly["time"])
+    df = pd.DataFrame({"timestamp": times})
+
+    wind_keys = _extract_member_cols(hourly, "wind_speed_80m")
+    if not wind_keys:
+        # fallback: some models might provide only mean/spread; in that case stop early
+        raise ValueError("Non trovo membri ensemble 'wind_speed_80m_member*' nella risposta Open-Meteo.")
+
+    for i, k in enumerate(wind_keys):
+        df[f"wind_speed_80m_member_{i}"] = pd.to_numeric(hourly[k], errors="coerce")
+
+    gust_keys = _extract_member_cols(hourly, "wind_gusts_10m") if include_gusts else []
+    if include_gusts and gust_keys and len(gust_keys) == len(wind_keys):
+        for i, k in enumerate(gust_keys):
+            df[f"wind_gusts_10m_member_{i}"] = pd.to_numeric(hourly[k], errors="coerce")
+
+    # Add demo prices if none (Open-Meteo doesn't provide energy prices)
+    df["price_eur_mwh"] = generate_price_series(df["timestamp"])
+
+    return df
+
+
+# -----------------------------
+# MOCK DATA (optional fallback)
+# -----------------------------
+def generate_mock_open_meteo_ensemble(
+    start: str = None,
+    days: int = 10,
+    n_members: int = 10,
+    seed: int = 42,
+    include_gusts: bool = True,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+
+    if start is None:
+        # start at today's midnight
+        start = pd.Timestamp.now().normalize().strftime("%Y-%m-%d %H:%M")
+
+    idx = pd.date_range(start=pd.to_datetime(start), periods=int(days * 24), freq="1h")
+    df = pd.DataFrame({"timestamp": idx})
+
+    df["price_eur_mwh"] = generate_price_series(df["timestamp"], seed=seed + 1)
+
+    hour = df["timestamp"].dt.hour.values
     day_index = ((df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds() / 86400).values
     di = np.floor(day_index).astype(int)
 
@@ -165,7 +250,6 @@ def generate_mock_open_meteo_ensemble(
         + 0.6 * np.sin((hour - 14) / 24 * 4 * np.pi)
     )
 
-    # Uncertainty increases after day 3
     sigma = np.where(di < 3, 0.9, 0.9 + (di - 2) * (3.2 / max(1, (days - 3))))
     sigma = np.clip(sigma, 0.9, 4.0)
 
@@ -187,24 +271,11 @@ def generate_mock_open_meteo_ensemble(
 # INPUT PARSING
 # -----------------------------
 def detect_members(df: pd.DataFrame) -> Tuple[List[str], Optional[List[str]]]:
-    """
-    Detect ensemble member columns.
-    Returns:
-      wind_cols: list ordered by member index
-      gust_cols: list ordered by member index (or None if absent)
-    """
     wind_cols = [c for c in df.columns if c.startswith("wind_speed_80m_member_")]
-
-    def key_member(col: str):
-        try:
-            return int(col.split("_")[-1])
-        except Exception:
-            return 999999
-
-    wind_cols = sorted(wind_cols, key=key_member)
+    wind_cols = sorted(wind_cols, key=lambda c: int(c.split("_")[-1]))
 
     gust_cols = [c for c in df.columns if c.startswith("wind_gusts_10m_member_")]
-    gust_cols = sorted(gust_cols, key=key_member) if gust_cols else None
+    gust_cols = sorted(gust_cols, key=lambda c: int(c.split("_")[-1])) if gust_cols else None
 
     if gust_cols is not None and len(gust_cols) != len(wind_cols):
         gust_cols = None
@@ -231,7 +302,7 @@ def plot_prices(df_view: pd.DataFrame) -> go.Figure:
         xaxis_title="Tempo",
         yaxis_title="€/MWh",
         template="plotly_white",
-        height=360,
+        height=340,
         margin=dict(l=10, r=10, t=55, b=10),
         hovermode="x unified",
     )
@@ -239,32 +310,16 @@ def plot_prices(df_view: pd.DataFrame) -> go.Figure:
 
 
 def plot_expected_production(df_view: pd.DataFrame, wind_cols: List[str]) -> go.Figure:
-    """
-    Produzione prevista oraria stimata dalla power curve.
-    Mostra media ensemble e banda P10–P90.
-    """
-    wind_mat = df_view[wind_cols].to_numpy(dtype=float)  # shape (T, M)
-
-    # Vectorize power curve
+    wind_mat = df_view[wind_cols].to_numpy(dtype=float)  # (T, M)
     v_power = np.vectorize(lambda w: power_curve_mw(w))
-    power_mat = v_power(wind_mat)  # shape (T, M), MW per ora
+    power_mat = v_power(wind_mat)
 
     p10 = np.percentile(power_mat, 10, axis=1)
     p90 = np.percentile(power_mat, 90, axis=1)
     mean = np.mean(power_mat, axis=1)
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df_view["timestamp"],
-            y=p90,
-            mode="lines",
-            line=dict(width=0),
-            showlegend=False,
-            hoverinfo="skip",
-            name="P90",
-        )
-    )
+    fig.add_trace(go.Scatter(x=df_view["timestamp"], y=p90, mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
     fig.add_trace(
         go.Scatter(
             x=df_view["timestamp"],
@@ -290,7 +345,7 @@ def plot_expected_production(df_view: pd.DataFrame, wind_cols: List[str]) -> go.
         xaxis_title="Tempo",
         yaxis_title="MW",
         template="plotly_white",
-        height=360,
+        height=340,
         margin=dict(l=10, r=10, t=55, b=10),
         hovermode="x unified",
     )
@@ -327,11 +382,6 @@ def check_min_window(
     step: Step,
     params: CraneParams,
 ) -> bool:
-    """
-    Check if there are at least min_seq_h consecutive "good" hours
-    starting from current hour within the SAME shift window.
-    Conservative: uses ceil(min_seq_h).
-    """
     needed = int(math.ceil(max(0.0, step.min_seq_h)))
     if needed <= 1:
         return True
@@ -371,6 +421,24 @@ def op_cost_for_hour(ts: pd.Timestamp, params: CraneParams) -> float:
     return params.op_cost_fest_eur_h if is_weekend(ts) else params.op_cost_std_eur_h
 
 
+def optimistic_completion_timestamp(d0: pd.Timestamp, total_work_h: float, params: CraneParams) -> pd.Timestamp:
+    """
+    Calendar completion with PERFECT weather:
+    - work progresses only during shift hours
+    - no standby
+    - start of activity is at D0 00:00, but first workable hour is shift_start
+    """
+    remaining = float(total_work_h)
+    t = pd.Timestamp(d0.date())  # 00:00
+
+    while remaining > 1e-9:
+        if in_work_shift(t, params.shift_start, params.shift_end):
+            remaining -= 1.0
+        t += pd.Timedelta(hours=1)
+
+    return t
+
+
 def simulate_single_start_day(
     df: pd.DataFrame,
     start_day: pd.Timestamp,
@@ -380,10 +448,6 @@ def simulate_single_start_day(
     params: CraneParams,
     rated_mw: float = 2.0,
 ) -> Dict:
-    """
-    Simulate for a given D0 (start_day date at 00:00) across all ensemble members.
-    Returns per-member totals + per-member hourly logs (for gantt/production aggregation).
-    """
     start_ts = pd.Timestamp(start_day.date())  # 00:00
     df = df.sort_values("timestamp").reset_index(drop=True)
 
@@ -407,7 +471,6 @@ def simulate_single_start_day(
         logs = []
         idx = start_idx
         incomplete = False
-
         last_ts = start_ts
 
         while step_i < len(steps):
@@ -419,7 +482,7 @@ def simulate_single_start_day(
             last_ts = ts
 
             step = steps[step_i]
-            step_name_for_log = step.name  # keep stable label for this hour
+            step_name_for_log = step.name
 
             w = df.at[idx, wind_col]
             g = df.at[idx, gust_col] if gust_col is not None else np.nan
@@ -433,7 +496,6 @@ def simulate_single_start_day(
             if not in_work_shift(ts, params.shift_start, params.shift_end):
                 state = "Stop Notte"
                 c_cost = 0.0
-                # no progress
             else:
                 ok = float(w) < float(step.wind_thr)
                 if gust_col is not None and step.gust_thr is not None:
@@ -547,12 +609,7 @@ def add_confidence(summary: pd.DataFrame) -> pd.DataFrame:
     return s
 
 
-def choose_optimal_day(summary_conf: pd.DataFrame, risk_aversion: float = 0.5) -> Tuple[Optional[pd.Timestamp], pd.DataFrame]:
-    """
-    Optimize score combining expected cost and uncertainty spread:
-    score = z(mean_cost) + risk_aversion * z(spread)
-    Lower score is better.
-    """
+def choose_optimal_day(summary_conf: pd.DataFrame, risk_aversion: float = 0.7) -> Tuple[Optional[pd.Timestamp], pd.DataFrame]:
     s = summary_conf.copy()
     mean = s["Costo Medio Atteso €"].to_numpy(dtype=float)
     spread = s["Spread (P90-P10) €"].to_numpy(dtype=float)
@@ -560,7 +617,9 @@ def choose_optimal_day(summary_conf: pd.DataFrame, risk_aversion: float = 0.5) -
     def z(x):
         f = np.isfinite(x)
         if f.sum() < 2:
-            return np.zeros_like(x)
+            out = np.full_like(x, np.nan, dtype=float)
+            out[f] = 0.0
+            return out
         mu = np.nanmean(x[f])
         sd = np.nanstd(x[f]) + 1e-9
         out = (x - mu) / sd
@@ -569,11 +628,11 @@ def choose_optimal_day(summary_conf: pd.DataFrame, risk_aversion: float = 0.5) -
 
     score = z(mean) + float(risk_aversion) * z(spread)
     s["Score (min meglio)"] = score
-    best_idx = int(np.nanargmin(score)) if np.any(np.isfinite(score)) else None
 
-    if best_idx is None:
+    if not np.any(np.isfinite(score)):
         return None, s
 
+    best_idx = int(np.nanargmin(score))
     best_day = pd.Timestamp(s.loc[best_idx, "Giorno Inizio (D0)"])
     return best_day, s
 
@@ -597,7 +656,6 @@ def plot_costs_band(summary: pd.DataFrame) -> go.Figure:
             line=dict(width=0),
             fill="tonexty",
             fillcolor="rgba(99, 102, 241, 0.18)",
-            showlegend=True,
             name="Incertezza (P10–P90)",
         )
     )
@@ -713,7 +771,6 @@ def compute_prod_loss_daily_for_selected(sim: Dict) -> pd.DataFrame:
         return pd.DataFrame()
 
     all_daily = pd.concat(by_member, ignore_index=True)
-
     out = (
         all_daily.groupby("date")["prod_loss_eur"]
         .agg(mean="mean", p10=lambda x: np.percentile(x, 10), p90=lambda x: np.percentile(x, 90))
@@ -726,30 +783,45 @@ def compute_prod_loss_daily_for_selected(sim: Dict) -> pd.DataFrame:
 # -----------------------------
 # UI
 # -----------------------------
-st.title("WTG Main Component – Decision Making Tool (stocastico su Ensemble)")
+st.title("WTG Main Component – Decision Making Tool (Open‑Meteo Ensemble)")
 
 with st.sidebar:
-    st.header("1) Parametri economici & operativi")
-
+    st.header("A) Parametri economici & operativi")
     mob_demob = st.number_input("Mob/Demob (una tantum) [€]", min_value=0.0, value=45000.0, step=1000.0)
     op_std = st.number_input("Costo operativo gru (standard) [€/h]", min_value=0.0, value=1200.0, step=50.0)
     op_fest = st.number_input("Costo operativo gru (festivo/weekend) [€/h]", min_value=0.0, value=1500.0, step=50.0)
     standby = st.number_input("Costo standby (solo in turno) [€/h]", min_value=0.0, value=650.0, step=25.0)
-
-    st.divider()
     shift_start = st.text_input("Inizio turno (HH:MM)", value="07:00")
     shift_end = st.text_input("Fine turno (HH:MM)", value="18:00")
 
     st.divider()
-    st.header("2) Forecast / dataset")
-    use_mock = st.toggle("Usa Mock Data (Open-Meteo Ensemble like)", value=True)
-    n_days_eval = st.slider("Giorni D0 da valutare (a partire dal primo giorno disponibile)", 3, 14, 7)
+    st.header("B) Open‑Meteo ensemble (live)")
+    latitude = st.number_input("Latitudine", value=41.5, format="%.6f")
+    longitude = st.number_input("Longitudine", value=15.2, format="%.6f")
+    model = st.selectbox(
+        "Modello ensemble",
+        options=[
+            "gfs_seamless",
+            "icon_seamless",
+            "ecmwf_ifs04",
+        ],
+        index=0,
+        help="Il set di modelli disponibili dipende da Open‑Meteo. Il tool richiede membri ensemble.",
+    )
+    forecast_days = st.slider("Forecast days (max 16)", min_value=3, max_value=16, value=10, step=1)
+    include_gusts = st.toggle("Usa wind_gusts_10m (se disponibili)", value=True)
+
+    st.divider()
+    st.header("C) Pianificazione")
+    earliest_day = st.date_input("Primo giorno organizzabile (earliest D0)", value=pd.Timestamp.now().date())
     risk_aversion = st.slider("Risk aversion (peso dell'incertezza)", 0.0, 2.0, 0.7, 0.1)
 
-    st.caption("Suggerimento: risk_aversion ↑ ⇒ preferisci date con spread P90–P10 più stretto.")
+    st.divider()
+    st.header("D) Debug")
+    use_mock = st.toggle("Usa Mock Data (solo debug)", value=False)
 
 
-# Validate shift input early
+# Validate shift
 try:
     _ = to_time(shift_start)
     _ = to_time(shift_end)
@@ -766,9 +838,7 @@ params = CraneParams(
     shift_end=shift_end,
 )
 
-# -----------------------------
-# STEPS TABLE
-# -----------------------------
+# Steps table
 st.subheader("Attività (step sequenziali)")
 
 default_steps = pd.DataFrame(
@@ -781,12 +851,7 @@ default_steps = pd.DataFrame(
     }
 )
 
-steps_df = st.data_editor(
-    default_steps,
-    num_rows="dynamic",
-    use_container_width=True,
-    hide_index=True,
-)
+steps_df = st.data_editor(default_steps, num_rows="dynamic", use_container_width=True, hide_index=True)
 
 steps: List[Step] = []
 for _, r in steps_df.iterrows():
@@ -798,74 +863,72 @@ for _, r in steps_df.iterrows():
     minw = float(r["Finestra minima consecutiva [h]"])
     steps.append(Step(name=name, duration_h=dur, wind_thr=wt, gust_thr=gt, min_seq_h=minw))
 
+total_work_h = float(sum(s.duration_h for s in steps))
 
-# -----------------------------
-# LOAD DATASET
-# -----------------------------
-@st.cache_data(show_spinner=False)
-def load_dataset_from_csv(file) -> pd.DataFrame:
-    df_local = pd.read_csv(file)
-    if "timestamp" not in df_local.columns:
-        raise ValueError("CSV deve contenere una colonna 'timestamp'.")
-    df_local["timestamp"] = pd.to_datetime(df_local["timestamp"])
-    return df_local
-
-
-@st.cache_data(show_spinner=False)
-def load_mock(days: int = 10, members: int = 10, include_gusts: bool = True) -> pd.DataFrame:
-    return generate_mock_open_meteo_ensemble(days=days, n_members=members, include_gusts=include_gusts)
-
-
-if use_mock:
-    df = load_mock(days=max(10, n_days_eval + 4), members=10, include_gusts=True)
-    st.info("Dataset: Mock Open‑Meteo Ensemble (10 membri) con gusts opzionali inclusi.")
-else:
-    up = st.file_uploader(
-        "Carica CSV forecast orario (timestamp, price_eur_mwh, wind_speed_80m_member_0..N, opzionale gusts)",
-        type=["csv"],
-    )
-    if up is None:
-        st.warning("Carica un CSV oppure attiva 'Usa Mock Data'.")
-        st.stop()
-    df = load_dataset_from_csv(up)
-
-# Basic checks
-if "timestamp" not in df.columns:
-    st.error("Manca la colonna 'timestamp'.")
-    st.stop()
+# Load meteo
+with st.spinner("Caricamento forecast Open‑Meteo..."):
+    if use_mock:
+        df = generate_mock_open_meteo_ensemble(days=int(forecast_days), n_members=10, include_gusts=include_gusts)
+        st.info("Usando Mock Data (debug).")
+    else:
+        df = fetch_open_meteo_ensemble(
+            latitude=float(latitude),
+            longitude=float(longitude),
+            model=str(model),
+            forecast_days=int(forecast_days),
+            include_gusts=bool(include_gusts),
+            timezone="auto",
+        )
+        st.success("Forecast caricato da Open‑Meteo Ensemble API. 【1-2f3670】【2-585a0d】")
 
 df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-if "price_eur_mwh" not in df.columns:
-    st.warning("Colonna 'price_eur_mwh' non trovata: la mancata produzione verrà calcolata come 0€.")
-    df["price_eur_mwh"] = 0.0
-
-wind_cols, gust_cols = detect_members(df)
-if not wind_cols:
-    st.error("Non ho trovato colonne wind ensemble (es. 'wind_speed_80m_member_0').")
-    st.stop()
-
 df = df.sort_values("timestamp").reset_index(drop=True)
 df["date"] = df["timestamp"].dt.date
 
-with st.expander("Anteprima dataset meteo", expanded=False):
+wind_cols, gust_cols = detect_members(df)
+if not wind_cols:
+    st.error("Non ho trovato colonne wind ensemble nel dataset.")
+    st.stop()
+
+forecast_start = df["timestamp"].min()
+forecast_end = df["timestamp"].max()
+
+# Determine D0 candidates: from earliest_day to last feasible day within forecast
+earliest_ts = pd.Timestamp(earliest_day)
+earliest_ts = clamp_date_to_forecast(earliest_ts, forecast_start, forecast_end)
+
+# Build candidate days (within forecast dates)
+all_days = pd.date_range(start=forecast_start.normalize(), end=forecast_end.normalize(), freq="1D")
+all_days = [d for d in all_days if d >= earliest_ts.normalize()]
+
+# Filter: only keep D0 where optimistic completion is <= forecast_end
+feasible_days = []
+for d0 in all_days:
+    comp_opt = optimistic_completion_timestamp(d0, total_work_h, params)
+    if comp_opt <= forecast_end:
+        feasible_days.append(d0)
+
+# If no feasible days, stop with explanation
+if len(feasible_days) == 0:
+    st.error(
+        "Nessun giorno D0 è analizzabile con l'attuale orizzonte di forecast: "
+        "la durata pianificata (anche con meteo perfetto) sfora oltre la fine dei dati disponibili. "
+        "Riduci la durata/step, amplia forecast_days (max 16) oppure scegli un D0 più vicino. "
+        "【1-2f3670】"
+    )
+    st.stop()
+
+# Show dataset preview
+with st.expander("Anteprima dataset (prime 48 ore)", expanded=False):
     st.dataframe(df.head(48), use_container_width=True)
 
-# -----------------------------
-# NEW: INPUT CONTEXT CHARTS
-# -----------------------------
+# Context charts
 st.subheader("Contesto dati di input (Power curve, prezzi, produzione prevista)")
 
-unique_days = pd.Series(df["date"].unique()).sort_values().tolist()
-days_to_test = unique_days[: min(len(unique_days), n_days_eval)]
-
-# define "periodo in esame" = from first D0 day start to end of last D0 day + 24h
-period_start = pd.Timestamp(days_to_test[0])
-period_end = pd.Timestamp(days_to_test[-1]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-
+# period in exam: from first feasible D0 to min(end of forecast, +3 days)
+period_start = feasible_days[0].normalize()
+period_end = min(forecast_end, period_start + pd.Timedelta(days=min(7, int(forecast_days))) - pd.Timedelta(seconds=1))
 df_view = df[(df["timestamp"] >= period_start) & (df["timestamp"] <= period_end)].copy()
-if df_view.empty:
-    df_view = df.copy()
 
 cA, cB = st.columns([1, 1])
 with cA:
@@ -875,29 +938,21 @@ with cB:
 
 st.plotly_chart(plot_expected_production(df_view, wind_cols), use_container_width=True)
 
-
-# -----------------------------
-# RUN SIMULATION FOR MULTIPLE D0
-# -----------------------------
+# Run simulations
 st.subheader("Risultati per giorno di inizio (D0)")
-
-if len(unique_days) < 2:
-    st.error("Dataset troppo corto: servono almeno 2 giorni orari.")
-    st.stop()
 
 sims = {}
 with st.spinner("Simulazione stocastica in corso (ensemble su più D0)..."):
-    for d in days_to_test:
-        sim = simulate_single_start_day(
+    for d in feasible_days:
+        sims[d] = simulate_single_start_day(
             df=df,
-            start_day=pd.Timestamp(d),
+            start_day=d,
             wind_cols=wind_cols,
             gust_cols=gust_cols,
             steps=steps,
             params=params,
             rated_mw=2.0,
         )
-        sims[pd.Timestamp(d)] = sim
 
 summary = compute_daily_summary(sims)
 summary = add_confidence(summary)
@@ -914,7 +969,6 @@ if best_day is not None and not scored.empty:
 else:
     st.warning("Non è stato possibile determinare una data ottimale (dati insufficienti).")
 
-# Table
 display_cols = [
     "Giorno Inizio (D0)",
     "Costo Min (P10) €",
@@ -935,50 +989,32 @@ st.dataframe(
     use_container_width=True,
 )
 
-# Charts
-c1, c2 = st.columns([1.15, 1.0])
-with c1:
-    st.plotly_chart(plot_costs_band(summary), use_container_width=True)
+st.plotly_chart(plot_costs_band(summary), use_container_width=True)
 
-with c2:
-    st.markdown("### Dettaglio per un D0 (Gantt medio + perdite)")
-    selected = st.selectbox(
-        "Seleziona giorno D0",
-        options=[pd.Timestamp(d).date() for d in days_to_test],
-        index=0,
-    )
-    sim_sel = sims.get(pd.Timestamp(selected))
-    if sim_sel is None or sim_sel.get("status") != "ok":
-        st.warning("Simulazione non disponibile per il giorno selezionato.")
-    else:
-        frac = aggregate_gantt(sim_sel["member_logs"])
-        if frac.empty:
-            st.warning("Nessun log disponibile (dataset troppo corto?).")
-        else:
-            st.plotly_chart(plot_gantt_fraction(frac), use_container_width=True)
+st.markdown("### Dettaglio per un D0 (Gantt medio + perdite)")
+selected = st.selectbox("Seleziona giorno D0", options=[d.date() for d in feasible_days], index=0)
+sim_sel = sims.get(pd.Timestamp(selected))
+if sim_sel is None or sim_sel.get("status") != "ok":
+    st.warning("Simulazione non disponibile per il giorno selezionato.")
+else:
+    frac = aggregate_gantt(sim_sel["member_logs"])
+    if not frac.empty:
+        st.plotly_chart(plot_gantt_fraction(frac), use_container_width=True)
 
-        prod_daily = compute_prod_loss_daily_for_selected(sim_sel)
-        if not prod_daily.empty:
-            st.plotly_chart(plot_daily_prod_loss_band(prod_daily), use_container_width=True)
-        else:
-            st.info("Non disponibile la perdita giornaliera (nessun log).")
+    prod_daily = compute_prod_loss_daily_for_selected(sim_sel)
+    if not prod_daily.empty:
+        st.plotly_chart(plot_daily_prod_loss_band(prod_daily), use_container_width=True)
 
-with st.expander("Note tecniche (assunzioni & come adattare a dati reali)", expanded=False):
+with st.expander("Perché prima vedevi NaN?", expanded=False):
     st.markdown(
         """
-**Assunzioni implementate:**
-- Simulazione **oraria**.
-- Fuori turno: attività ferma, **costo gru = 0€**, ma la **mancata produzione continua H24**.
-- In turno:
-  - Step non avviato: richiede finestra minima consecutiva “buona” a partire dall’ora corrente.
-  - Step avviato: meteo sopra soglia ⇒ **Standby** (costo standby in turno).
-- Festivi: qui trattati come **weekend**.
+I NaN arrivano quando **tutti** gli scenari per un dato D0 risultano **incompleti** (ossia la simulazione
+arriva a fine forecast senza terminare lo step finale).  
+Questo succede tipicamente per D0 troppo vicini alla fine del forecast.  
 
-**Grafici aggiunti:**
-- Power curve (2 MW) per leggere vento→MW.
-- Prezzi orari nel periodo in esame.
-- Produzione prevista oraria stimata da power curve usando media ensemble + banda P10–P90.
+Ora l'app **filtra automaticamente** i D0 e considera solo quelli per cui la durata pianificata
+(senza standby, solo vincolo turno/notte) termina **entro** il forecast.
 """
     )
 
-st.caption("✅ Pronto: salva come app.py e avvia con `streamlit run app.py`.")
+st.caption("✅ Avvio: `streamlit run app.py`")
