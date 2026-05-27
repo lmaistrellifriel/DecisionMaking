@@ -885,10 +885,38 @@ df["timestamp"] = pd.to_datetime(df["timestamp"])
 df = df.sort_values("timestamp").reset_index(drop=True)
 df["date"] = df["timestamp"].dt.date
 
-wind_cols, gust_cols = detect_members(df)
-if not wind_cols:
+wind_cols_full, gust_cols_full = detect_members(df)
+
+if not wind_cols_full:
     st.error("Non ho trovato colonne wind ensemble nel dataset.")
     st.stop()
+
+# =============================
+# PERFORMANCE SETTINGS
+# =============================
+col_perf1, col_perf2 = st.columns(2)
+
+with col_perf1:
+    use_all_members = st.toggle("Usa tutti gli scenari ensemble", value=False)
+
+with col_perf2:
+    n_scenarios = st.number_input(
+        "Numero scenari",
+        min_value=5,
+        max_value=len(wind_cols_full),
+        value=10,
+        step=1,
+        disabled=use_all_members
+    )
+
+# selezione effettiva
+if use_all_members:
+    wind_cols = wind_cols_full
+    gust_cols = gust_cols_full
+else:
+    n = min(len(wind_cols_full), int(n_scenarios))
+    wind_cols = wind_cols_full[:n]
+    gust_cols = gust_cols_full[:n] if gust_cols_full is not None else None
 
 forecast_start = df["timestamp"].min()
 forecast_end = df["timestamp"].max()
@@ -938,21 +966,58 @@ with cB:
 
 st.plotly_chart(plot_expected_production(df_view, wind_cols), use_container_width=True)
 
+# =============================
+# STIMA TEMPO
+# =============================
+n_days = len(feasible_days)
+n_members_used = len(wind_cols)
+total_work_h = sum(s.duration_h for s in steps)
+
+# stima empirica
+complexity = n_days * n_members_used * total_work_h * 2.5
+estimated_seconds = complexity / 60000
+
+col_run1, col_run2 = st.columns([1,2])
+
+with col_run1:
+    run_simulation = st.button("▶️ Esegui simulazione", type="primary")
+
+with col_run2:
+    if estimated_seconds < 1:
+        st.info("⏱️ Tempo stimato: <1 secondo")
+    else:
+        st.info(f"⏱️ Tempo stimato: ~{estimated_seconds:.1f} s")
+
+
+
 # Run simulations
 st.subheader("Risultati per giorno di inizio (D0)")
 
+run_simulation = st.button("▶️ Esegui simulazione", type="primary")
+
 sims = {}
-with st.spinner("Simulazione stocastica in corso (ensemble su più D0)..."):
-    for d in feasible_days:
-        sims[d] = simulate_single_start_day(
-            df=df,
-            start_day=d,
-            wind_cols=wind_cols,
-            gust_cols=gust_cols,
-            steps=steps,
-            params=params,
-            rated_mw=2.0,
-        )
+
+if run_simulation:
+
+    with st.spinner("Simulazione stocastica in corso..."):
+        for d in feasible_days:
+            sims[d] = simulate_single_start_day(
+                df=df,
+                start_day=d,
+                wind_cols=wind_cols,
+                gust_cols=gust_cols,
+                steps=steps,
+                params=params,
+                rated_mw=2.0,
+            )
+
+    summary = compute_daily_summary(sims)
+    summary = add_confidence(summary)
+    best_day, scored = choose_optimal_day(summary, risk_aversion=risk_aversion)
+
+else:
+    st.info("👉 Premi 'Esegui simulazione' per calcolare i risultati.")
+    st.stop()
 
 summary = compute_daily_summary(sims)
 summary = add_confidence(summary)
