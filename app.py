@@ -845,4 +845,3 @@ with st.expander("Note tecniche (assunzioni & come adattare a dati reali)", expa
     )
 
 st.caption("✅ Pronto: salva come app.py e avvia con `streamlit run app.py`.")
-``
