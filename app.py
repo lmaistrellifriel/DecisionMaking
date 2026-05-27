@@ -1,4 +1,4 @@
-pip install streamlit pandas numpy plotly
+
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
