@@ -181,7 +181,6 @@ def fetch_open_meteo_ensemble(
     include_gusts: bool,
     timezone: str = "auto",
 ) -> pd.DataFrame:
-    # Chiediamo 80m, 100m (fallback ottimo per ECMWF) e 10m per massima robustezza multipiattaforma
     hourly_vars = ["wind_speed_80m", "wind_speed_100m", "wind_speed_10m"]
     if include_gusts:
         hourly_vars.append("wind_gusts_10m")
@@ -206,22 +205,18 @@ def fetch_open_meteo_ensemble(
     times = pd.to_datetime(hourly["time"])
     df = pd.DataFrame({"timestamp": times})
 
-    # --- CASCATA FALLBACK MEMBRI ENSEMBLE VENTO ---
     wind_keys = _extract_member_cols(hourly, "wind_speed_80m")
     var_usata = "wind_speed_80m"
     
     if not wind_keys:
-        # Se mancano gli 80m (tipico di ECMWF IFS), ripieghiamo sui 100m che sono eccellenti per quote hub
         wind_keys = _extract_member_cols(hourly, "wind_speed_100m")
         var_usata = "wind_speed_100m"
         
     if not wind_keys:
-        # Estrema ratio sui 10 metri
         wind_keys = _extract_member_cols(hourly, "wind_speed_10m")
         var_usata = "wind_speed_10m"
 
     if not wind_keys:
-        # Scansione dinamica disperata su qualsiasi chiave che contenga 'wind_speed'
         chiavi_alternative = [k for k in hourly.keys() if "wind_speed" in k]
         for ca in chiavi_alternative:
             radice = ca.split("_member")[0]
@@ -236,14 +231,11 @@ def fetch_open_meteo_ensemble(
             f"Variabili ritornate dall'API: {list(hourly.keys())}"
         )
 
-    # Standardizziamo le colonne iniettate nel DF con il nome atteso dal codice di simulazione
     for i, k in enumerate(wind_keys):
         df[f"wind_speed_80m_member_{i}"] = pd.to_numeric(hourly[k], errors="coerce")
 
-    # --- CASCATA FALLBACK MEMBRI ENSEMBLE RAFFICHE ---
     gust_keys = _extract_member_cols(hourly, "wind_gusts_10m") if include_gusts else []
     if include_gusts and not gust_keys:
-        # Se mancano le raffiche a 10m, verifichiamo se esistono ad altre quote
         chiavi_gust = [k for k in hourly.keys() if "wind_gusts" in k]
         for cg in chiavi_gust:
             radice = cg.split("_member")[0]
@@ -632,7 +624,6 @@ def simulate_single_start_day_profit(
         if partial and remaining_work_h > 0:
             penalty_eur = (avg_loss_per_hour * calendar_hours_remaining) + (avg_crane_per_shift_hour * remaining_work_h)
 
-        # STRATEGIA 2: Perdita Totale dell'Intervento (valore positivo da minimizzare)
         costo_totale_intervento = mob_demob_apply + crane_cost + lost_revenue
 
         member_rows.append(
@@ -667,11 +658,7 @@ def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataF
         mr = sim["member_results"]
 
         # --- FILTRO FLESSIBILE ---
-        # Calcola la frazione di membri rimasti a metà (lavoro parziale)
         quota_incompleti = mr["partial"].mean() 
-        
-        # Se più del 20% dei modelli stocastici prevede un fallimento/ritardo imprevisto, 
-        # consideriamo la giornata non pianificabile operativamente.
         if quota_incompleti > 0.20: 
             continue
 
@@ -691,7 +678,6 @@ def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataF
             }
         )
 
-    # Gestione di emergenza se nessuna giornata supera il filtro impostato
     if not rows:
         return pd.DataFrame(columns=[
             "Giorno Inizio (D0)", 
@@ -700,43 +686,6 @@ def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataF
             "Perdita P90 €", 
             "Spread (P90-P10) €"
         ])
-
-    # Creazione del DataFrame finale ordinato cronologicamente
-    out = pd.DataFrame(rows).sort_values("Giorno Inizio (D0)")
-    return out.reset_index(drop=True)
-
-    # Gestione del caso in cui nessuna giornata superi il filtro
-    if not rows:
-        return pd.DataFrame(columns=[
-            "Giorno Inizio (D0)", 
-            "Perdita P10 €", 
-            "Perdita Media €", 
-            "Perdita P90 €", 
-            "Spread (P90-P10) €"
-        ])
-
-    out = pd.DataFrame(rows).sort_values("Giorno Inizio (D0)")
-    return out.reset_index(drop=True)
-
-        # FILTRO FLASSIBILE: Accettiamo il giorno se almeno il 80% degli scenari completa il lavoro quota_incompleti = mr["partial"].mean() # Calcola la frazione di membri rimasti a metà
-    if quota_incompleti > 0.20: # Se più del 10% dei modelli prevede un fallimento, scarta il giorno
-           continue
-
-        costi = mr["profit_net_eur"].to_numpy(dtype=float)
-        p10 = safe_percentile(costi, 10)
-        p90 = safe_percentile(costi, 90)
-        mean = float(np.nanmean(costi[np.isfinite(costi)])) if np.any(np.isfinite(costi)) else np.nan
-        spread = p90 - p10 if np.isfinite(p10) and np.isfinite(p90) else np.nan
-
-        rows.append(
-            {
-                "Giorno Inizio (D0)": pd.Timestamp(d0).date(),
-                "Perdita P10 €": p10,
-                "Perdita Media €": mean,
-                "Perdita P90 €": p90,
-                "Spread (P90-P10) €": spread,
-            }
-        )
 
     out = pd.DataFrame(rows).sort_values("Giorno Inizio (D0)")
     return out.reset_index(drop=True)
@@ -755,7 +704,7 @@ def choose_optimal_day_profit(summary: pd.DataFrame, risk_aversion: float = 0.7)
     if not np.any(np.isfinite(score)):
         return None, s
 
-    best_idx = int(np.nanargmin(score))  # Cerchiamo il MINIMO costo combinato
+    best_idx = int(np.nanargmin(score))
     best_day = pd.Timestamp(s.loc[best_idx, "Giorno Inizio (D0)"])
     return best_day, s
 
@@ -783,11 +732,9 @@ def plot_profit_candles(summary_scored: pd.DataFrame) -> go.Figure:
         
         spessore = current_mean * 0.03
         if current_mean <= prev_mean:
-            # Ribasso del costo rispetto a ieri -> Azzurro
             opens.append(current_mean + spessore)
             closes.append(current_mean - spessore)
         else:
-            # Rialzo del costo rispetto a ieri -> Arancione
             opens.append(current_mean - spessore)
             closes.append(current_mean + spessore)
 
@@ -811,7 +758,6 @@ def plot_profit_candles(summary_scored: pd.DataFrame) -> go.Figure:
         )
     )
 
-    # Stile esatto image_af30c0.png
     fig.update_traces(
         increasing=dict(fillcolor="#f59e0b", line=dict(color="#f59e0b", width=1)),
         decreasing=dict(fillcolor="#06b6d4", line=dict(color="#06b6d4", width=1)),
@@ -1003,7 +949,6 @@ with st.sidebar:
     st.header("E) Debug")
     use_mock = st.toggle("Usa Mock Data (solo debug)", value=False)
 
-# Validazione turni
 try:
     t0 = to_time(shift_start)
     t1 = to_time(shift_end)
@@ -1023,7 +968,6 @@ params = CraneParams(
     shift_end=shift_end,
 )
 
-# Tabella attività modificabile
 st.subheader("Attività (step sequenziali)")
 default_steps = pd.DataFrame(
     {
@@ -1060,7 +1004,6 @@ if len(steps) == 0:
 
 total_work_h = float(sum(s.duration_h for s in steps))
 
-# Caricamento meteo sincrono
 with st.spinner("Caricamento forecast Open‑Meteo..."):
     if use_mock:
         df = generate_mock_open_meteo_ensemble(days=int(forecast_days), n_members=20, include_gusts=include_gusts)
@@ -1121,7 +1064,6 @@ total_sims = len(all_days)
 horizon_hours = int((forecast_end - horizon_start).total_seconds() / 3600)
 est_sec = heuristic_estimate_seconds(len(wind_cols_use), total_sims, horizon_hours, total_work_h)
 
-# Generazione dell'Hash MD5 per verificare modifiche agli input
 cur_hash = hashlib.md5(json.dumps({
     "m": len(wind_cols_use), "d": [str(x) for x in all_days],
     "s": [(s.name, s.duration_h, s.wind_thr, s.requires_crane) for s in steps],
@@ -1229,7 +1171,7 @@ else:
 with st.expander("Note sulla logica di calcolo dei Costi Isolati & Filtro 100%", expanded=False):
     st.markdown(
         """
-**Isolamento Economico (Strategia 2):** I grafici e le tabelle mostrano la **Perdita Totale dell'intervento** (espressa come valore positivo). Questa è la somma aritmetica di:
+**Isolamento Economico (Strategia 2):** I grafici e le tabelle mostrano la **Perdita Totale dell'intervento** (espressa como valore positivo). Questa è la somma aritmetica di:
 1. Costo fisso di mobilitazione e smobilitazione della gru (`Mob/Demob`).
 2. Costi operativi e orari della gru (tariffe standard, festive o di standby a seconda dello stato orario del cantiere).
 3. Mancata produzione energetica calcolata $H24$ dal momento dell'interruzione ($D_0$) fino al termine dei lavori.
