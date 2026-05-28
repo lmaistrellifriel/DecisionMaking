@@ -198,6 +198,10 @@ def fetch_open_meteo_ensemble(
     include_gusts: bool,
     timezone: str = "auto",
 ) -> pd.DataFrame:
+    """
+    In generale l'Ensemble API permette fino a 16 giorni, ma l'orizzonte effettivo può variare per modello. 【1-6067e7】【2-4ba79d】
+    Qui chiediamo 'forecast_days', ma poi useremo SOLO il periodo realmente ritornato dall'API (df timestamp min/max).
+    """
     hourly_vars = ["wind_speed_80m"]
     if include_gusts:
         hourly_vars.append("wind_gusts_10m")
@@ -580,46 +584,41 @@ def compute_daily_summary_cost(all_sims: Dict[pd.Timestamp, Dict], structural_in
     return pd.DataFrame(rows).sort_values("Giorno Inizio (D0)").reset_index(drop=True)
 
 
-def choose_optimal_day_cost(summary: pd.DataFrame, last_possible_start: Optional[pd.Timestamp], risk_aversion: float = 0.7) -> Tuple[Optional[pd.Timestamp], pd.DataFrame]:
+def choose_optimal_day_cost(summary: pd.DataFrame, last_possible_start: Optional[pd.Timestamp], risk_aversion: float = 0.7) -> Tuple[Optional[pd.Timestamp], pd.DataFrame, str]:
     """
     MINIMIZZAZIONE:
     Score = CostoMedio + risk_aversion*Spread
 
-    Vincoli richiesti:
-    - Non scegliere come "Miglior D0" giorni dopo last_possible_start (anche se plottati e simulati).
-    - "Nessun D0 ottimo" SOLO se, tra i candidati (<= last_possible_start), Probabilità Successo = 0% per tutti.
+    "Nessun D0 ottimo" SOLO se:
+      - tra i candidati (<= last_possible_start) la Probabilità Successo massima è 0%
+      - oppure non esistono candidati perché earliest_day è oltre la finestra che consente completamento.
+
+    Inoltre:
+      - mai scegliere oltre last_possible_start (se esiste)
     """
     s = summary.copy()
     if s.empty:
-        return None, s
+        return None, s, "Nessun dato"
 
     mean = s["Costo Medio €"].to_numpy(dtype=float)
     spread = np.nan_to_num(s["Spread (P90-P10) €"].to_numpy(dtype=float), nan=0.0)
     score = mean + float(risk_aversion) * spread
     s["Score (min meglio)"] = score
 
-    # Se non abbiamo last_possible_start (perché tutti strutturalmente impossibili),
-    # allora NON scegliamo automaticamente l'ultimo giorno; valutiamo il caso "nessun ottimo" con prob=0.
     if last_possible_start is None:
-        # se qualcuno ha prob_success > 0, scegli tra tutti; altrimenti None
-        if np.nanmax(s["Probabilità Successo (%)"].to_numpy(dtype=float)) <= 0.0:
-            return None, s
-        best_idx = int(np.nanargmin(s["Score (min meglio)"].to_numpy(dtype=float)))
-        best_day = pd.Timestamp(s.loc[best_idx, "Giorno Inizio (D0)"])
-        return best_day, s
+        # nessun giorno strutturalmente completabile: non c'è finestra temporale sufficiente
+        return None, s, "Finestra temporale insufficiente (nessun D0 completabile per ore turno disponibili)"
 
-    # candidati solo fino all'ultimo giorno possibile
     candidates = s[pd.to_datetime(s["Giorno Inizio (D0)"]) <= pd.Timestamp(last_possible_start.date())].copy()
     if candidates.empty:
-        return None, s
+        return None, s, "La data minima D0 è oltre l’ultimo giorno utile per iniziare"
 
-    # condizione "nessun ottimo" (casi 1 e 2 come da tua definizione)
     if np.nanmax(candidates["Probabilità Successo (%)"].to_numpy(dtype=float)) <= 0.0:
-        return None, s
+        return None, s, "Probabilità di completamento = 0% per tutti i D0 candidabili"
 
     best_idx = int(np.nanargmin(candidates["Score (min meglio)"].to_numpy(dtype=float)))
     best_day = pd.Timestamp(candidates.iloc[best_idx]["Giorno Inizio (D0)"])
-    return best_day, s
+    return best_day, s, ""
 
 
 def plot_cost_candles(summary_for_plot: pd.DataFrame) -> go.Figure:
@@ -806,6 +805,21 @@ with st.spinner("Caricamento dati meteo..."):
 df["timestamp"] = pd.to_datetime(df["timestamp"])
 df = df.sort_values("timestamp").reset_index(drop=True)
 
+# --- ORIZZONTE REALE (MODEL-DEPENDENT) ---
+forecast_start = df["timestamp"].min()
+forecast_end = df["timestamp"].max()
+actual_forecast_days = int((forecast_end.normalize() - forecast_start.normalize()).days) + 1
+
+if actual_forecast_days < int(forecast_days) and not use_mock:
+    st.warning(
+        f"⚠️ Il modello selezionato ha restituito {actual_forecast_days} giorni di forecast "
+        f"(richiesti: {int(forecast_days)}). Verrà usato SOLO l'orizzonte reale disponibile."
+    )
+st.caption(
+    f"Orizzonte reale disponibile: {forecast_start.strftime('%d/%m/%Y %H:%M')} → "
+    f"{forecast_end.strftime('%d/%m/%Y %H:%M')} ({actual_forecast_days} giorni)"
+)
+
 wind_cols_all, gust_cols_all = detect_members(df)
 if not wind_cols_all:
     st.error("Nessun membro ensemble trovato nel dataset.")
@@ -814,17 +828,16 @@ if not wind_cols_all:
 wind_cols_use = wind_cols_all if use_all_members else wind_cols_all[:min(len(wind_cols_all), int(n_members_input))]
 gust_cols_use = gust_cols_all[:len(wind_cols_use)] if gust_cols_all else None
 
-forecast_start = df["timestamp"].min()
-forecast_end = df["timestamp"].max()
+# Orizzonte di analisi parte dalla data minima (o inizio forecast reale)
 horizon_start = max(forecast_start.normalize(), pd.Timestamp(earliest_day))
 
-all_days = pd.date_range(start=horizon_start.normalize(), end=forecast_end.normalize(), freq="1D")
-all_days = list(all_days)
+# ALL D0 days fino all'ultimo giorno REALE disponibile
+all_days = pd.date_range(start=horizon_start.normalize(), end=forecast_end.normalize(), freq="1D").to_list()
 if not all_days:
-    st.error("Nessun giorno D0 disponibile nell'intervallo forecast.")
+    st.error("Nessun giorno D0 disponibile nell'orizzonte reale.")
     st.stop()
 
-# Always-visible plots
+# Always-visible plots (aggiornano con l'orizzonte reale)
 st.subheader("Contesto meteo & produzione (sempre visibile)")
 preview_end = min(forecast_end, horizon_start + pd.Timedelta(days=5) - pd.Timedelta(seconds=1))
 df_view = df[(df["timestamp"] >= horizon_start) & (df["timestamp"] <= preview_end)].copy()
@@ -834,10 +847,9 @@ with c1:
     st.plotly_chart(plot_power_curve(), use_container_width=True)
 with c2:
     st.plotly_chart(plot_wind_speed_ensemble(df_view, wind_cols_use), use_container_width=True)
-
 st.plotly_chart(plot_expected_production(df_view, wind_cols_use), use_container_width=True)
 
-# Structural infeasible map + last possible start
+# Structural infeasible map + last possible start (based on forecast_end reale)
 structural_infeasible = {}
 available_work_h_map = {}
 
@@ -857,9 +869,9 @@ feasible_days_only = [pd.Timestamp(d) for d in all_days if not structural_infeas
 last_possible_start = pd.Timestamp(feasible_days_only[-1]) if feasible_days_only else None
 
 if last_possible_start is not None:
-    st.caption(f"Ultimo D0 strutturalmente completabile (ore turno sufficienti): {last_possible_start.date()}")
+    st.caption(f"Ultimo D0 possibile (ore turno sufficienti fino a fine forecast reale): {last_possible_start.date()}")
 else:
-    st.caption("Ultimo D0 strutturalmente completabile: nessuno (ore turno insufficienti in tutto l’orizzonte)")
+    st.caption("Ultimo D0 possibile: nessuno (ore turno insufficienti nell’orizzonte reale)")
 
 # Time estimate + run
 st.subheader("Simulazione stocastica (Costi totali)")
@@ -881,6 +893,7 @@ cur_hash = hashlib.md5(json.dumps({
     "p": [mob_demob, op_std, op_fest, standby, shift_start, shift_end],
     "ra": risk_aversion,
     "hs": str(horizon_start),
+    "fe": str(forecast_end),
 }, sort_keys=True).encode()).hexdigest()
 
 if "sims_cost" not in st.session_state:
@@ -918,19 +931,16 @@ if st.session_state["sims_cost"] is None:
 
 sims = st.session_state["sims_cost"]
 summary = compute_daily_summary_cost(sims, structural_infeasible)
-best_d0, scored = choose_optimal_day_cost(summary, last_possible_start, risk_aversion=risk_aversion)
+best_d0, scored, reason_none = choose_optimal_day_cost(summary, last_possible_start, risk_aversion=risk_aversion)
 
 st.header("Risultati (Costi totali + Probabilità di completamento)")
 
 c1, c2, c3, c4 = st.columns(4)
 if best_d0 is None:
     c1.metric("Miglior D0", "Nessun D0 ottimo")
-    c2.metric("Motivo", "Probabilità completamento = 0% per tutte le date candidabili")
+    c2.metric("Motivo", reason_none if reason_none else "n.d.")
     c3.metric("Ore richieste", f"{required_work_h:.0f} h turno")
-    if last_possible_start is None:
-        c4.metric("Ultimo D0 possibile", "Nessuno")
-    else:
-        c4.metric("Ultimo D0 possibile", str(last_possible_start.date()))
+    c4.metric("Ultimo D0 possibile", str(last_possible_start.date()) if last_possible_start is not None else "Nessuno")
 else:
     rb = scored[scored["Giorno Inizio (D0)"] == best_d0.date()].iloc[0]
     c1.metric("Miglior D0 (min costo medio)", best_d0.strftime("%d/%m/%Y"))
