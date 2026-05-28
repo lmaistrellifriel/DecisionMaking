@@ -171,7 +171,7 @@ def generate_price_series(ts: pd.Series, seed: int = 7) -> np.ndarray:
 
 
 # -----------------------------
-# OPEN-METEO: FETCH ENSEMBLE (Ripristinato da allegato)
+# OPEN-METEO: FETCH ENSEMBLE
 # -----------------------------
 OPEN_METEO_ENSEMBLE_ENDPOINT = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
@@ -221,7 +221,7 @@ def fetch_open_meteo_ensemble(
     times = pd.to_datetime(hourly["time"])
     df = pd.DataFrame({"timestamp": times})
 
-    # Ricerca delle colonne dei membri basata sui pattern nativi dell'API Ensemble
+    # Estrazione dinamica dei membri della simulazione
     wind_keys = _extract_member_cols(hourly, "wind_speed_80m")
     if not wind_keys:
         candidates = sorted([k for k in hourly.keys() if "wind_speed" in k and "member" in k])
@@ -359,7 +359,7 @@ def plot_expected_production(df_view: pd.DataFrame, wind_cols: List[str]) -> go.
 
 
 # -----------------------------
-# SIMULATION CORE (Monte Carlo / Cost Only)
+# SIMULATION CORE (Monte Carlo Logica Corrente)
 # -----------------------------
 @dataclass
 class CraneParams:
@@ -694,7 +694,13 @@ with st.sidebar:
     st.header("B) Open‑Meteo ensemble")
     latitude = st.number_input("Latitudine", value=41.5)
     longitude = st.number_input("Longitudine", value=15.2)
-    model = st.selectbox("Modello", options=["gfs_seamless", "icon_seamless", "ecmwf_ifs04"])
+    
+    # "ecmwf_ifs025" è la stringa API nativa corretta per l'Ensemble ECMWF. Inclusi anche altri modelli utili.
+    model = st.selectbox(
+        "Modello", 
+        options=["gfs_seamless", "icon_seamless", "ecmwf_ifs025", "icon_eu", "gem_global", "ecmwf_aifs025"],
+        index=2
+    )
     forecast_days = st.slider("Giorni forecast (richiesti)", 3, 16, 10)
     include_gusts = st.toggle("Usa raffiche", value=True)
 
@@ -731,7 +737,7 @@ params = CraneParams(
     shift_end=shift_end,
 )
 
-st.subheader("Pianificazione Attività (step)")
+st.subheader("Pianificazione Actvities (step)")
 
 default_steps = pd.DataFrame({
     "Step": ["Step 1", "Step 2", "Step 3"],
@@ -814,7 +820,7 @@ if not all_days:
     st.error("Nessun giorno D0 disponibile nell'orizzonte reale.")
     st.stop()
 
-# Layout grafici (sempre visibili)
+# Layout dei grafici (Sempre Visibili come da mockup)
 st.subheader("Contesto meteo & produzione (sempre visibile)")
 preview_end = min(forecast_end, horizon_start + pd.Timedelta(days=5) - pd.Timedelta(seconds=1))
 df_view = df[(df["timestamp"] >= horizon_start) & (df["timestamp"] <= preview_end)].copy()
