@@ -666,9 +666,9 @@ def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataF
             continue
         mr = sim["member_results"]
 
-        # FILTRO DI COMPLETAMENTO RESTRITTIVO: Solo giorni D0 in cui l'attività giunge al 100% in TUTTI i membri
-        if mr["partial"].any():
-            continue
+        # FILTRO FLASSIBILE: Accettiamo il giorno se almeno il 80% degli scenari completa il lavoro quota_incompleti = mr["partial"].mean() # Calcola la frazione di membri rimasti a metà
+    if quota_incompleti > 0.20: # Se più del 10% dei modelli prevede un fallimento, scarta il giorno
+           continue
 
         costi = mr["profit_net_eur"].to_numpy(dtype=float)
         p10 = safe_percentile(costi, 10)
