@@ -10,9 +10,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
-import streamlit as str_st  # Evita conflitti interni di namespace
-
-# Cambiato alias temporaneamente per preservare lo standard st
 import streamlit as st
 
 # -----------------------------
@@ -155,7 +152,7 @@ def plot_power_curve() -> go.Figure:
 
 
 # -----------------------------
-# PRICES
+# PRICES (mock)
 # -----------------------------
 def generate_price_series(ts: pd.Series, seed: int = 7) -> np.ndarray:
     rng = np.random.default_rng(seed)
@@ -174,7 +171,7 @@ def generate_price_series(ts: pd.Series, seed: int = 7) -> np.ndarray:
 
 
 # -----------------------------
-# OPEN-METEO: FETCH ENSEMBLE
+# OPEN-METEO: FETCH ENSEMBLE (Ripristinato da allegato)
 # -----------------------------
 OPEN_METEO_ENSEMBLE_ENDPOINT = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
@@ -200,7 +197,6 @@ def fetch_open_meteo_ensemble(
     include_gusts: bool,
     timezone: str = "auto",
 ) -> pd.DataFrame:
-    # Parametri esatti per ripristinare il corretto funzionamento dell'endpoint di OpenMeteo Ensemble
     hourly_vars = ["wind_speed_80m"]
     if include_gusts:
         hourly_vars.append("wind_gusts_10m")
@@ -225,7 +221,7 @@ def fetch_open_meteo_ensemble(
     times = pd.to_datetime(hourly["time"])
     df = pd.DataFrame({"timestamp": times})
 
-    # Mappatura solida delle colonne basata sulla risposta JSON nativa dell'Ensemble OpenMeteo
+    # Ricerca delle colonne dei membri basata sui pattern nativi dell'API Ensemble
     wind_keys = _extract_member_cols(hourly, "wind_speed_80m")
     if not wind_keys:
         candidates = sorted([k for k in hourly.keys() if "wind_speed" in k and "member" in k])
@@ -236,22 +232,14 @@ def fetch_open_meteo_ensemble(
     if not wind_keys:
         raise ValueError(f"Impossibile mappare membri ensemble wind_speed_* per '{model}'.")
 
-    # Unità di misura: conversione automatica se l'API risponde in km/h anziché m/s
-    v_unit = js.get("hourly_units", {}).get(wind_keys[0], "m/s")
-    need_conversion = "km/h" in v_unit
-
     for i, k in enumerate(wind_keys):
-        vals = pd.to_numeric(hourly[k], errors="coerce")
-        df[f"wind_speed_80m_member_{i}"] = vals / 3.6 if need_conversion else vals
+        df[f"wind_speed_80m_member_{i}"] = pd.to_numeric(hourly[k], errors="coerce")
 
     gust_keys = _extract_member_cols(hourly, "wind_gusts_10m") if include_gusts else []
     if include_gusts and gust_keys:
-        g_unit = js.get("hourly_units", {}).get(gust_keys[0], "m/s")
-        g_need_conversion = "km/h" in g_unit
         for i, k in enumerate(gust_keys):
             if i < len(wind_keys):
-                vals_g = pd.to_numeric(hourly[k], errors="coerce")
-                df[f"wind_gusts_10m_member_{i}"] = vals_g / 3.6 if g_need_conversion else vals_g
+                df[f"wind_gusts_10m_member_{i}"] = pd.to_numeric(hourly[k], errors="coerce")
 
     df["price_eur_mwh"] = generate_price_series(df["timestamp"])
     return df
@@ -309,7 +297,7 @@ def detect_members(df: pd.DataFrame) -> Tuple[List[str], Optional[List[str]]]:
 
 
 # -----------------------------
-# PLOTS: wind & production (Ripristinati come da allegato originale)
+# PLOTS: wind & production
 # -----------------------------
 def plot_wind_speed_ensemble(df_view: pd.DataFrame, wind_cols: List[str]) -> go.Figure:
     wind_mat = df_view[wind_cols].to_numpy(dtype=float)
@@ -318,7 +306,6 @@ def plot_wind_speed_ensemble(df_view: pd.DataFrame, wind_cols: List[str]) -> go.
     mean = np.mean(wind_mat, axis=1)
 
     fig = go.Figure()
-    # Per visualizzare correttamente la banda fill='tonexty' serve inserire prima il limite superiore P90 (nascosto)
     fig.add_trace(go.Scatter(x=df_view["timestamp"], y=p90, mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
     fig.add_trace(go.Scatter(
         x=df_view["timestamp"], y=p10, mode="lines", line=dict(width=0),
@@ -350,7 +337,6 @@ def plot_expected_production(df_view: pd.DataFrame, wind_cols: List[str]) -> go.
     mean = np.mean(power_mat, axis=1)
 
     fig = go.Figure()
-    # Ripristino esatto dell'area riempita per la produzione attesa
     fig.add_trace(go.Scatter(x=df_view["timestamp"], y=p90, mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
     fig.add_trace(go.Scatter(
         x=df_view["timestamp"], y=p10, mode="lines", line=dict(width=0),
@@ -373,7 +359,7 @@ def plot_expected_production(df_view: pd.DataFrame, wind_cols: List[str]) -> go.
 
 
 # -----------------------------
-# SIMULATION CORE (cost only)
+# SIMULATION CORE (Monte Carlo / Cost Only)
 # -----------------------------
 @dataclass
 class CraneParams:
@@ -788,7 +774,7 @@ if not steps:
 
 required_work_h = float(sum(s.duration_h for s in steps))
 
-# Load meteo
+# Caricamento dati meteo
 with st.spinner("Caricamento dati meteo..."):
     if use_mock:
         df = generate_mock_open_meteo_ensemble(days=int(forecast_days), n_members=30, include_gusts=include_gusts)
@@ -828,7 +814,7 @@ if not all_days:
     st.error("Nessun giorno D0 disponibile nell'orizzonte reale.")
     st.stop()
 
-# --- POSIZIONAMENTO RIGIDO DEI GRAFICI DA ALLEGATO ---
+# Layout grafici (sempre visibili)
 st.subheader("Contesto meteo & produzione (sempre visibile)")
 preview_end = min(forecast_end, horizon_start + pd.Timedelta(days=5) - pd.Timedelta(seconds=1))
 df_view = df[(df["timestamp"] >= horizon_start) & (df["timestamp"] <= preview_end)].copy()
@@ -840,7 +826,6 @@ with c2:
     st.plotly_chart(plot_wind_speed_ensemble(df_view, wind_cols_use), use_container_width=True)
 st.plotly_chart(plot_expected_production(df_view, wind_cols_use), use_container_width=True)
 
-# Maps e simulazione finale
 structural_infeasible = {}
 available_work_h_map = {}
 
