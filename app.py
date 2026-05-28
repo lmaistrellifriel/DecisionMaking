@@ -108,14 +108,16 @@ def fetch_historical_data(lat, lon, data_d0):
         hourly_data = res.get("hourly", {})
         
         v_data = hourly_data.get("windspeed_100m", hourly_data.get("windspeed_10m", []))
-        g_data = hourly_data.get("windgusts_10m", [])
+        g_data = hourly_data.get("wind_gusts_10m", hourly_data.get("windgusts_10m", [])) # Accetta entrambe le varianti API
         time_seq = pd.to_datetime(hourly_data.get("time", []))
         
         if res.get("hourly_units", {}).get("windspeed_100m", "km/h") == "km/h":
             v_data = [v / 3.6 for v in v_data]
             g_data = [g / 3.6 for g in g_data]
             
+        # Qui mappiamo i nomi che poi useremo nella simulazione
         df_anno = pd.DataFrame({"vento": v_data, "raffica": g_data, "anno": anno}, index=time_seq)
+            
         df_storico_lista.append(df_anno)
         
     return pd.concat(df_storico_lista)
