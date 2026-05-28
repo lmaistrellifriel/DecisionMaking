@@ -618,7 +618,7 @@ def simulate_single_start_day_profit(
         if partial and remaining_work_h > 0:
             penalty_eur = (avg_loss_per_hour * calendar_hours_remaining) + (avg_crane_per_shift_hour * remaining_work_h)
 
-        profit_net = rev_marcia - (mob_demob_apply + crane_cost + lost_revenue)
+        profit_net = - (mob_demob_apply + crane_cost + lost_revenue)
 
         member_rows.append(
             {
@@ -748,9 +748,9 @@ def plot_profit_candles(summary_scored: pd.DataFrame) -> go.Figure:
     )
 
     fig.update_layout(
-        title="Profitto Netto vs giorno di inizio (candela P10–P90, colore per bontà D0)",
+        title="Impatto Economico dell'Intervento vs giorno di inizio (candela P10–P90, colore per bontà D0)",
         xaxis_title="Giorno di inizio D0",
-        yaxis_title="Profitto Netto (€)",
+        yaxis_title="Impatto Economico dell'Intervento (€)",
         template="plotly_white",
         height=430,
         margin=dict(l=10, r=10, t=60, b=10),
@@ -1077,7 +1077,7 @@ col1, col2, col3 = st.columns(3)
 if best_d0:
     row_best = scored[scored["Giorno Inizio (D0)"] == best_d0.date()].iloc[0]
     col1.metric("Giorno Ottimale Suggerito (D0)", best_d0.strftime("%d/%m/%Y"))
-    col2.metric("Profitto Netto Atteso", f"{row_best['Profitto Medio €']:,.0f} €")
+    col2.metric("Impatto Economico dell'Intervento Atteso", f"{row_best['Profitto Medio €']:,.0f} €")
     col3.metric("Rischio di Sforamento (Spread)", f"{row_best['Spread (P90-P10) €']:,.0f} €")
 else:
     col1.warning("Nessun giorno D0 ottimale identificato.")
@@ -1120,7 +1120,7 @@ if sim_sel and sim_sel.get("status") == "ok":
     if not prod_daily.empty:
         st.plotly_chart(plot_daily_prod_loss_band(prod_daily), use_container_width=True)
 
-with st.expander("Note sul concetto di Profitto Netto", expanded=False):
+with st.expander("Note sul concetto di Impatto Economico dell'Intervento", expanded=False):
     st.markdown(
         """
 **Periodo di Marcia (horizon_start → D0):** la turbina produce e incassa:  
