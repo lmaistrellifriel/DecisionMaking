@@ -1,5 +1,6 @@
 import math
 import re
+import time 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -779,6 +780,25 @@ def compute_prod_loss_daily_for_selected(sim: Dict) -> pd.DataFrame:
     )
     return out
 
+def estimate_simulation_time(df, wind_cols, gust_cols, steps, params, n_members, n_days):
+    """Benchmark 1 membro × 1 giorno, poi scala linearmente."""
+    if not wind_cols or n_days == 0:
+        return 0.0
+    sample_day = pd.Timestamp(df["timestamp"].min().date())
+    t0 = time.perf_counter()
+    simulate_single_start_day(
+        df=df, start_day=sample_day,
+        wind_cols=wind_cols[:1], gust_cols=gust_cols[:1] if gust_cols else None,
+        steps=steps, params=params, rated_mw=2.0,
+    )
+    elapsed = time.perf_counter() - t0
+    return elapsed * n_members * n_days
+
+def format_time_estimate(seconds):
+    if seconds < 1:   return "< 1 secondo"
+    if seconds < 60:  return f"~{seconds:.0f} secondi"
+    return f"~{seconds/60:.1f} minuti"
+
 
 # -----------------------------
 # UI
@@ -811,6 +831,14 @@ with st.sidebar:
     forecast_days = st.slider("Forecast days (max 16)", min_value=3, max_value=16, value=10, step=1)
     include_gusts = st.toggle("Usa wind_gusts_10m (se disponibili)", value=True)
 
+    st.divider()
+    st.header("C) Simulazione ensemble")
+    n_members_input = st.number_input(
+        "Numero di membri ensemble da usare",
+        min_value=1, max_value=50, value=10, step=1,
+        help="Limita gli scenari usati. Più membri = più affidabilità, ma più lento."
+    )
+    
     st.divider()
     st.header("C) Pianificazione")
     earliest_day = st.date_input("Primo giorno organizzabile (earliest D0)", value=pd.Timestamp.now().date())
@@ -941,69 +969,97 @@ st.plotly_chart(plot_expected_production(df_view, wind_cols), use_container_widt
 # Run simulations
 st.subheader("Risultati per giorno di inizio (D0)")
 
-sims = {}
-with st.spinner("Simulazione stocastica in corso (ensemble su più D0)..."):
-    for d in feasible_days:
+# --- Clamp membri disponibili ---
+n_members_available = len(wind_cols)
+n_members_to_use = min(int(n_members_input), n_members_available)
+wind_cols_use = wind_cols[:n_members_to_use]
+gust_cols_use = gust_cols[:n_members_to_use] if gust_cols else None
+
+if n_members_to_use < int(n_members_input):
+    st.warning(f"Dataset contiene solo {n_members_available} membri. Uso {n_members_to_use}.")
+
+# --- Stima tempo ---
+st.subheader("Simulazione stocastica")
+with st.spinner("Calcolo stima tempo..."):
+    try:
+        est_s = estimate_simulation_time(df, wind_cols_use, gust_cols_use, steps, params, n_members_to_use, len(feasible_days))
+    except Exception:
+        est_s = 0.0
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Giorni D0 analizzabili", len(feasible_days))
+c2.metric("Membri ensemble attivi", n_members_to_use)
+c3.metric("Simulazioni totali", len(feasible_days) * n_members_to_use)
+st.info(f"⏱️ **Tempo stimato:** {format_time_estimate(est_s)}  —  {n_members_to_use} membri × {len(feasible_days)} giorni")
+
+# --- Run button con session state ---
+import hashlib, json
+cur_hash = hashlib.md5(json.dumps({
+    "m": n_members_to_use, "d": [str(x) for x in feasible_days],
+    "s": [(s.name, s.duration_h, s.wind_thr) for s in steps],
+    "p": [mob_demob, op_std, op_fest, standby, shift_start, shift_end],
+}, sort_keys=True).encode()).hexdigest()
+
+if "sims" not in st.session_state: st.session_state["sims"] = None
+if "sims_hash" not in st.session_state: st.session_state["sims_hash"] = None
+
+if st.session_state["sims"] and st.session_state["sims_hash"] != cur_hash:
+    st.warning("⚠️ Parametri cambiati dall'ultima esecuzione. Premi il pulsante per aggiornare.")
+
+if st.button("▶ Esegui simulazione", type="primary", use_container_width=True):
+    sims = {}
+    prog = st.progress(0, text="Avvio...")
+    t_start = time.perf_counter()
+    for i, d in enumerate(feasible_days):
         sims[d] = simulate_single_start_day(
-            df=df,
-            start_day=d,
-            wind_cols=wind_cols,
-            gust_cols=gust_cols,
-            steps=steps,
-            params=params,
-            rated_mw=2.0,
+            df=df, start_day=d,
+            wind_cols=wind_cols_use, gust_cols=gust_cols_use,
+            steps=steps, params=params, rated_mw=2.0,
         )
+        elapsed = time.perf_counter() - t_start
+        rem = (elapsed / (i+1)) * (len(feasible_days) - i - 1)
+        prog.progress(int((i+1)/len(feasible_days)*100),
+                      text=f"D0 {i+1}/{len(feasible_days)} — rimanente: {format_time_estimate(rem)}")
+    prog.empty()
+    st.session_state["sims"] = sims
+    st.session_state["sims_hash"] = cur_hash
+    st.success(f"✅ Completata in {format_time_estimate(time.perf_counter()-t_start)}.")
 
-summary = compute_daily_summary(sims)
-summary = add_confidence(summary)
-best_day, scored = choose_optimal_day(summary, risk_aversion=risk_aversion)
+# --- Risultati (solo se presenti) ---
+if st.session_state["sims"]:
+    sims = st.session_state["sims"]
+    st.subheader("Risultati per giorno di inizio (D0)")
+    summary = add_confidence(compute_daily_summary(sims))
+    best_day, scored = choose_optimal_day(summary, risk_aversion=risk_aversion)
 
-# KPI
-kpi_cols = st.columns([1.2, 1.2, 1.2, 1.4])
-if best_day is not None and not scored.empty:
-    best_row = scored.loc[scored["Giorno Inizio (D0)"] == best_day.date()].iloc[0]
-    kpi_cols[0].metric("Data ottimale (D0)", str(best_day.date()))
-    kpi_cols[1].metric("Costo medio atteso", f"{best_row['Costo Medio Atteso €']:,.0f} €")
-    kpi_cols[2].metric("P90–P10 (spread)", f"{best_row['Spread (P90-P10) €']:,.0f} €")
-    kpi_cols[3].metric("Confidenza", f"{best_row['Livello di Confidenza']:.1f} %")
+    kc = st.columns(4)
+    if best_day is not None:
+        br = scored.loc[scored["Giorno Inizio (D0)"] == best_day.date()].iloc[0]
+        kc[0].metric("Data ottimale (D0)", str(best_day.date()))
+        kc[1].metric("Costo medio atteso", f"{br['Costo Medio Atteso €']:,.0f} €")
+        kc[2].metric("P90–P10 (spread)", f"{br['Spread (P90-P10) €']:,.0f} €")
+        kc[3].metric("Confidenza", f"{br['Livello di Confidenza']:.1f} %")
+
+    st.dataframe(summary[["Giorno Inizio (D0)","Costo Min (P10) €","Costo Medio Atteso €",
+                           "Costo Max (P90) €","Livello di Confidenza","Scenari incompleti"
+                          ]].style.format({
+        "Costo Min (P10) €": "{:,.0f}", "Costo Medio Atteso €": "{:,.0f}",
+        "Costo Max (P90) €": "{:,.0f}", "Livello di Confidenza": "{:.1f}",
+    }), use_container_width=True)
+    st.plotly_chart(plot_costs_band(summary), use_container_width=True)
+
+    st.markdown("### Dettaglio D0 selezionato")
+    selected = st.selectbox("Seleziona giorno D0", [d.date() for d in feasible_days])
+    sim_sel = sims.get(pd.Timestamp(selected))
+    if sim_sel and sim_sel.get("status") == "ok":
+        frac = aggregate_gantt(sim_sel["member_logs"])
+        if not frac.empty:
+            st.plotly_chart(plot_gantt_fraction(frac), use_container_width=True)
+        prod_daily = compute_prod_loss_daily_for_selected(sim_sel)
+        if not prod_daily.empty:
+            st.plotly_chart(plot_daily_prod_loss_band(prod_daily), use_container_width=True)
 else:
-    st.warning("Non è stato possibile determinare una data ottimale (dati insufficienti).")
-
-display_cols = [
-    "Giorno Inizio (D0)",
-    "Costo Min (P10) €",
-    "Costo Medio Atteso €",
-    "Costo Max (P90) €",
-    "Livello di Confidenza",
-    "Scenari incompleti",
-]
-st.dataframe(
-    summary[display_cols].style.format(
-        {
-            "Costo Min (P10) €": "{:,.0f}",
-            "Costo Medio Atteso €": "{:,.0f}",
-            "Costo Max (P90) €": "{:,.0f}",
-            "Livello di Confidenza": "{:.1f}",
-        }
-    ),
-    use_container_width=True,
-)
-
-st.plotly_chart(plot_costs_band(summary), use_container_width=True)
-
-st.markdown("### Dettaglio per un D0 (Gantt medio + perdite)")
-selected = st.selectbox("Seleziona giorno D0", options=[d.date() for d in feasible_days], index=0)
-sim_sel = sims.get(pd.Timestamp(selected))
-if sim_sel is None or sim_sel.get("status") != "ok":
-    st.warning("Simulazione non disponibile per il giorno selezionato.")
-else:
-    frac = aggregate_gantt(sim_sel["member_logs"])
-    if not frac.empty:
-        st.plotly_chart(plot_gantt_fraction(frac), use_container_width=True)
-
-    prod_daily = compute_prod_loss_daily_for_selected(sim_sel)
-    if not prod_daily.empty:
-        st.plotly_chart(plot_daily_prod_loss_band(prod_daily), use_container_width=True)
+    st.info("👆 Configura i parametri e premi **Esegui simulazione** per avviare l'analisi.")
 
 with st.expander("Perché prima vedevi NaN?", expanded=False):
     st.markdown(
