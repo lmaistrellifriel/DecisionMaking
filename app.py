@@ -106,37 +106,6 @@ def power_curve_mw(
         return rated_mw
     return 0.0
 
-def plot_power_curve(
-    rated_mw: float = 2.0,
-    cut_in: float = 3.0,
-    rated: float = 12.0,
-    cut_out: float = 25.0,
-) -> go.Figure:
-    wind = np.linspace(0, 30, 300)
-    power = [power_curve_mw(w, rated_mw=rated_mw, cut_in=cut_in, rated=rated, cut_out=cut_out) for w in wind]
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=wind,
-            y=power,
-            mode="lines",
-            line=dict(color="rgba(34,197,94,1)", width=3),
-            name="Power curve",
-            hovertemplate="Vento: %{x:.1f} m/s<br>Potenza: %{y:.2f} MW<extra></extra>",
-        )
-    )
-    fig.update_layout(
-        title="Power Curve Turbina (2 MW)",
-        xaxis_title="Wind speed [m/s]",
-        yaxis_title="Power [MW]",
-        template="plotly_white",
-        height=320,
-        margin=dict(l=10, r=10, t=55, b=10),
-        hovermode="x unified",
-    )
-    return fig
-
 # -----------------------------
 # PRICES (mock)
 # -----------------------------
@@ -206,15 +175,12 @@ def fetch_open_meteo_ensemble(
     df = pd.DataFrame({"timestamp": times})
 
     wind_keys = _extract_member_cols(hourly, "wind_speed_80m")
-    var_usata = "wind_speed_80m"
     
     if not wind_keys:
         wind_keys = _extract_member_cols(hourly, "wind_speed_100m")
-        var_usata = "wind_speed_100m"
         
     if not wind_keys:
         wind_keys = _extract_member_cols(hourly, "wind_speed_10m")
-        var_usata = "wind_speed_10m"
 
     if not wind_keys:
         chiavi_alternative = [k for k in hourly.keys() if "wind_speed" in k]
@@ -222,13 +188,11 @@ def fetch_open_meteo_ensemble(
             radice = ca.split("_member")[0]
             wind_keys = _extract_member_cols(hourly, radice)
             if wind_keys:
-                var_usata = radice
                 break
 
     if not wind_keys:
         raise ValueError(
-            f"Impossibile mappare membri ensemble di tipo 'wind_speed' per il modello '{model}'. "
-            f"Variabili ritornate dall'API: {list(hourly.keys())}"
+            f"Impossibile mappare membri ensemble di tipo 'wind_speed' per il modello '{model}'."
         )
 
     for i, k in enumerate(wind_keys):
@@ -335,22 +299,6 @@ def plot_wind_speed_ensemble(df_view: pd.DataFrame, wind_cols: List[str]) -> go.
     )
     fig.add_trace(go.Scatter(x=df_view["timestamp"], y=mean, mode="lines", line=dict(color="rgba(14, 165, 233, 1)", width=2.8), name="Vento Medio"))
     fig.update_layout(title="Velocità del vento prevista [m/s]", template="plotly_white", height=320)
-    return fig
-
-def plot_expected_production(df_view: pd.DataFrame, wind_cols: List[str]) -> go.Figure:
-    wind_mat = df_view[wind_cols].to_numpy(dtype=float)
-    v_power = np.vectorize(lambda w: power_curve_mw(w))
-    power_mat = v_power(wind_mat)
-
-    p10 = np.percentile(power_mat, 10, axis=1)
-    p90 = np.percentile(power_mat, 90, axis=1)
-    mean = np.mean(power_mat, axis=1)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df_view["timestamp"], y=p90, mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
-    fig.add_trace(go.Scatter(x=df_view["timestamp"], y=p10, mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(59,130,246,0.18)", name="P10–P90"))
-    fig.add_trace(go.Scatter(x=df_view["timestamp"], y=mean, mode="lines", line=dict(color="rgba(59,130,246,1)", width=2.4), name="Media"))
-    fig.update_layout(title="Produzione prevista oraria [MW]", template="plotly_white", height=320)
     return fig
 
 # -----------------------------
@@ -491,7 +439,7 @@ def simulate_single_start_day_profit(
     }
 
 # -----------------------------
-# LOGICA RICHIESTA: COMPUTE SUMMARY CON PROBABILITÀ
+# PROBABILISTIC LOGIC (SUMMARY)
 # -----------------------------
 def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataFrame:
     rows = []
@@ -499,7 +447,7 @@ def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataF
         if sim.get("status") != "ok": continue
         mr = sim["member_results"]
         
-        # LOGICA CORRETTA: Nessun giorno viene cancellato. Calcoliamo la probabilità di successo reale
+        # LOGICA RICHIESTA: Estrae puramente la probabilità reale di successo per tutta l'attività
         total_scenarios = len(mr)
         successful_scenarios = len(mr[mr["partial"] == False])
         prob_success = (successful_scenarios / total_scenarios) * 100.0 if total_scenarios > 0 else 0.0
@@ -527,10 +475,9 @@ def choose_optimal_day_profit(summary: pd.DataFrame, risk_aversion: float = 0.7)
 
     mean = s["Perdita Media €"].to_numpy(dtype=float)
     spread = s["Spread (P90-P10) €"].to_numpy(dtype=float)
-    prob_fail_factor = (100.0 - s["Probabilità Successo (%)"].to_numpy(dtype=float)) * 250  # Penalizza chi ha bassa fattibilità
 
-    # Lo score bilancia costo atteso, volatilità (spread) e probabilità di fallimento dello step
-    score = mean + float(risk_aversion) * np.nan_to_num(spread, nan=0.0) + prob_fail_factor
+    # Formula dello score lineare e pulito (costo + avversione al rischio dello spread finanziario)
+    score = mean + float(risk_aversion) * np.nan_to_num(spread, nan=0.0)
     s["Score (min meglio)"] = score
 
     best_idx = int(np.nanargmin(score))
@@ -598,7 +545,7 @@ def plot_gantt_fraction(frac: pd.DataFrame) -> go.Figure:
     return fig
 
 # -----------------------------
-# UI APP
+# UI STREAMLIT APP
 # -----------------------------
 st.title("WTG Main Component – Loss Minimizer (Stochastic Feasibility)")
 
@@ -620,7 +567,8 @@ with st.sidebar:
     st.divider()
     st.header("C) Campionamento")
     use_all_members = st.toggle("Usa tutti i membri", value=False)
-    n_members_input = St.number_input("Membri da usare", min_value=1, value=10, disabled=use_all_members)
+    # CORREZIONE ERRORE RIGA 623: 'St' modificato nel corretto alias di streamlit 'st'
+    n_members_input = st.number_input("Membri da usare", min_value=1, value=10, disabled=use_all_members)
     st.divider()
     st.header("D) Ottimizzazione")
     earliest_day = st.date_input("Data di inizio minima", value=pd.Timestamp.now().date())
