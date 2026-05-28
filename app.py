@@ -308,7 +308,6 @@ def plot_prices(df_view: pd.DataFrame) -> go.Figure:
     return fig
 
 def plot_wind_speed_ensemble(df_view: pd.DataFrame, wind_cols: List[str]) -> go.Figure:
-    """ NUOVO: Grafico con la velocità del vento ad altezze multiple dello stesso tipo della produzione """
     wind_mat = df_view[wind_cols].to_numpy(dtype=float)
 
     p10 = np.percentile(wind_mat, 10, axis=1)
@@ -475,19 +474,11 @@ def simulate_single_start_day_profit(
     params: CraneParams,
     rated_mw: float = 2.0,
 ) -> Dict:
-    """
-    MODIFICATO:
-    - Logica Look-Ahead per la gru: calcola i costi solo se lo step corrente o quelli successivi la richiedono.
-    - Se l'ultimo step non richiede la gru, nell'ultimo step i suoi costi orari sono 0.
-    """
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     start_ts = pd.Timestamp(start_day.date())
-    horizon_start_ts = pd.Timestamp(horizon_start)
-
     start_idx = int(df["timestamp"].searchsorted(start_ts))
-    hs_idx = int(df["timestamp"].searchsorted(horizon_start_ts))
-    if hs_idx >= len(df):
+    if start_idx >= len(df):
         return {"status": "out_of_range"}
 
     member_rows = []
@@ -498,17 +489,6 @@ def simulate_single_start_day_profit(
 
     for m, wind_col in enumerate(wind_cols):
         gust_col = gust_cols[m] if gust_cols is not None else None
-
-        # --- Periodo di Marcia ---
-        if start_idx <= hs_idx:
-            rev_marcia = 0.0
-        else:
-            sl = slice(hs_idx, start_idx)
-            wind_arr = df.loc[sl, wind_col].to_numpy(dtype=float)
-            price_arr = df.loc[sl, "price_eur_mwh"].to_numpy(dtype=float)
-            v_power = np.vectorize(lambda w: power_curve_mw(w, rated_mw=rated_mw))
-            p_mw = v_power(wind_arr)
-            rev_marcia = float(np.nansum(p_mw * price_arr))
 
         # --- Periodo di Fermo (dal D0) ---
         step_i = 0
@@ -523,7 +503,6 @@ def simulate_single_start_day_profit(
         logs = []
         idx = start_idx
         last_ts = df["timestamp"].iloc[min(start_idx, len(df)-1)]
-        partial = False
 
         while idx < len(df) and step_i < len(steps):
             ts = df.at[idx, "timestamp"]
@@ -540,9 +519,7 @@ def simulate_single_start_day_profit(
             lost_revenue += loss_eur
             fermo_hours_sim += 1
 
-            # NUOVO: Look-Ahead presenza della gru (presente se lo step corrente o i successivi la richiedono)
             crane_present = any(s.requires_crane for s in steps[step_i:])
-
             c_cost = 0.0
 
             if not in_work_shift(ts, params.shift_start, params.shift_end):
@@ -618,13 +595,14 @@ def simulate_single_start_day_profit(
         if partial and remaining_work_h > 0:
             penalty_eur = (avg_loss_per_hour * calendar_hours_remaining) + (avg_crane_per_shift_hour * remaining_work_h)
 
-        profit_net = - (mob_demob_apply + crane_cost + lost_revenue)
+        # STRATEGIA 2: Calcoliamo la PERDITA TOTALE dell'intervento (valore positivo).
+        # Il giorno migliore sarà quello che MINIMIZZA questa perdita complessiva.
+        costo_totale_intervento = mob_demob_apply + crane_cost + lost_revenue
 
         member_rows.append(
             {
                 "member": m,
-                "profit_net_eur": profit_net,
-                "rev_marcia_eur": rev_marcia,
+                "profit_net_eur": costo_totale_intervento,  # Mappato su questa chiave storica per retrocompatibilità interna
                 "mob_demob_eur": mob_demob_apply,
                 "crane_cost_eur": crane_cost,
                 "lost_revenue_eur": lost_revenue,
@@ -652,24 +630,24 @@ def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataF
             continue
         mr = sim["member_results"]
 
-        profits = mr["profit_net_eur"].to_numpy(dtype=float)
-        p10 = safe_percentile(profits, 10)
-        p90 = safe_percentile(profits, 90)
-        mean = float(np.nanmean(profits[np.isfinite(profits)])) if np.any(np.isfinite(profits)) else np.nan
-        spread = p90 - p10 if np.isfinite(p10) and np.isfinite(p90) else np.nan
+        # FILTRO DI COMPLETAMENTO RESTRITTIVO:
+        # Escludiamo completamente i giorni D0 in cui anche un solo membro/scenario ensemble non completa i lavori
+        if mr["partial"].any():
+            continue
 
-        partial_rate = float(mr["partial"].mean()) if len(mr) else 0.0
-        penalty_mean = float(np.nanmean(mr["penalty_eur"].to_numpy(dtype=float))) if len(mr) else 0.0
+        costi = mr["profit_net_eur"].to_numpy(dtype=float)
+        p10 = safe_percentile(costi, 10)
+        p90 = safe_percentile(costi, 90)
+        mean = float(np.nanmean(costi[np.isfinite(costi)])) if np.any(np.isfinite(costi)) else np.nan
+        spread = p90 - p10 if np.isfinite(p10) and np.isfinite(p90) else np.nan
 
         rows.append(
             {
                 "Giorno Inizio (D0)": pd.Timestamp(d0).date(),
-                "Profitto P10 €": p10,
-                "Profitto Medio €": mean,
-                "Profitto P90 €": p90,
+                "Perdita P10 €": p10,
+                "Perdita Media €": mean,
+                "Perdita P90 €": p90,
                 "Spread (P90-P10) €": spread,
-                "Parziale %": partial_rate * 100.0,
-                "Penalità parziale media €": penalty_mean,
             }
         )
 
@@ -678,89 +656,110 @@ def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataF
 
 def choose_optimal_day_profit(summary: pd.DataFrame, risk_aversion: float = 0.7) -> Tuple[Optional[pd.Timestamp], pd.DataFrame]:
     s = summary.copy()
-    mean = s["Profitto Medio €"].to_numpy(dtype=float)
-    spread = s["Spread (P90-P10) €"].to_numpy(dtype=float)
-    pen = s["Penalità parziale media €"].to_numpy(dtype=float)
+    if s.empty:
+        return None, s
 
-    score = mean - float(risk_aversion) * np.nan_to_num(spread, nan=0.0) - np.nan_to_num(pen, nan=0.0)
-    s["Score (max meglio)"] = score
+    mean = s["Perdita Media €"].to_numpy(dtype=float)
+    spread = s["Spread (P90-P10) €"].to_numpy(dtype=float)
+
+    # Più la perdita è alta, peggiore è lo scenario. Lo spread aumenta il rischio e quindi peggiora il punteggio.
+    score = mean + float(risk_aversion) * np.nan_to_num(spread, nan=0.0)
+    s["Score (min meglio)"] = score
 
     if not np.any(np.isfinite(score)):
         return None, s
 
-    best_idx = int(np.nanargmax(score))
+    best_idx = int(np.nanargmin(score))  # Cerchiamo il MINIMO costo combinato
     best_day = pd.Timestamp(s.loc[best_idx, "Giorno Inizio (D0)"])
     return best_day, s
 
 # -----------------------------
-# PROFIT CANDLESTICK-LIKE PLOT
+# FINANCIAL CANDLESTICK PLOT
 # -----------------------------
 def plot_profit_candles(summary_scored: pd.DataFrame) -> go.Figure:
-    dfp = summary_scored.copy()
+    if summary_scored.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title="Nessun giorno D0 disponibile con completamento garantito al 100%",
+            template="plotly_white"
+        )
+        return fig
+
+    dfp = summary_scored.copy().sort_values("Giorno Inizio (D0)")
     x = dfp["Giorno Inizio (D0)"].astype(str)
-    p10 = dfp["Profitto P10 €"].to_numpy(dtype=float)
-    p90 = dfp["Profitto P90 €"].to_numpy(dtype=float)
-    mean = dfp["Profitto Medio €"].to_numpy(dtype=float)
-    score = dfp["Score (max meglio)"].to_numpy(dtype=float)
+    
+    # Costruiamo Open e Close fittizi centrati sulla Media per forzare la colorazione alternata del corpo:
+    # Se il costo di oggi cala rispetto a ieri -> Azzurro (Miglioramento)
+    # Se il costo di oggi aumenta rispetto a ieri -> Arancione (Peggioramento)
+    opens = []
+    closes = []
 
-    smin = np.nanmin(score) if np.any(np.isfinite(score)) else 0.0
-    smax = np.nanmax(score) if np.any(np.isfinite(score)) else 1.0
-    denom = (smax - smin) if (smax - smin) > 1e-9 else 1.0
-    norm = (score - smin) / denom
-
-    def lerp(a, b, t):
-        return a + (b - a) * t
-
-    colors = []
-    for t in norm:
-        if not np.isfinite(t):
-            colors.append("rgba(148,163,184,0.8)")
+    for i in range(len(dfp)):
+        current_mean = dfp.iloc[i]["Perdita Media €"]
+        prev_mean = dfp.iloc[i-1]["Perdita Media €"] if i > 0 else current_mean
+        
+        spessore = current_mean * 0.03  # Spessore visivo del blocco candela centrale (±3%)
+        if current_mean <= prev_mean:
+            # Ribasso del costo: Open è sopra, Close è sotto -> Colore Azzurro
+            opens.append(current_mean + spessore)
+            closes.append(current_mean - spessore)
         else:
-            r = int(lerp(220, 34, t))
-            g = int(lerp(38, 197, t))
-            b = int(lerp(38, 94, t))
-            colors.append(f"rgba({r},{g},{b},0.85)")
+            # Rialzo del costo: Open è sotto, Close è sopra -> Colore Arancione
+            opens.append(current_mean - spessore)
+            closes.append(current_mean + spessore)
 
-    body = (p90 - p10)
     fig = go.Figure()
 
+    # Utilizzo della struttura go.Candlestick nativa per replicare lo stile ombra verticale sottile di image_af30c0.png
     fig.add_trace(
-        go.Bar(
+        go.Candlestick(
             x=x,
-            y=body,
-            base=p10,
-            marker=dict(color=colors),
-            name="Intervallo P10–P90",
-            hovertemplate="D0: %{x}<br>P10: %{base:,.0f} €<br>P90: %{y+base:,.0f} €<extra></extra>",
+            open=opens,
+            high=dfp["Perdita P90 €"],
+            low=dfp["Perdita P10 €"],
+            close=closes,
+            name="Impatto Finanziario",
+            hoverinfo="x+y",
+            hovertemplate=(
+                "<b>Data D0: %{x}</b><br>"
+                "Max Rischio (P90): %{high:,.0f} €<br>"
+                "Costo Medio Atteso: %{close:,.0f} €<br>"
+                "Min Rischio (P10): %{low:,.0f} €<br><extra></extra>"
+            )
         )
     )
 
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=mean,
-            mode="lines+markers",
-            line=dict(color="rgba(15,23,42,0.9)", width=2),
-            marker=dict(size=7, color=colors),
-            name="Profitto medio",
-            hovertemplate="D0: %{x}<br>Profitto medio: %{y:,.0f} €<extra></extra>",
-        )
+    # Definizione esatta dei colori del mockup dell'utente
+    fig.update_traces(
+        increasing=dict(fillcolor="#f59e0b", line=dict(color="#f59e0b", width=1)), # Arancione per rialzi di costo
+        decreasing=dict(fillcolor="#06b6d4", line=dict(color="#06b6d4", width=1)), # Azzurro per ribassi di costo
+        whiskerwidth=0,       # Elimina i trattini orizzontali in cima/fondo alle ombre verticali
+        line=dict(width=1.5)  # Spessore del fusto verticale (wick)
     )
 
+    # Layout pulito con sfondo interno grigio/azzurro chiarissimo (#f8fafc) e griglie chiare nitede
     fig.update_layout(
-        title="Impatto Economico dell'Intervento vs giorno di inizio (candela P10–P90, colore per bontà D0)",
-        xaxis_title="Giorno di inizio D0",
-        yaxis_title="Impatto Economico dell'Intervento (€)",
+        title="Perdita Totale dell'Intervento vs Giorno di Inizio D0 (Solo Giorni Completati al 100%)",
+        yaxis_title="Perdita Totale (€)",
+        xaxis_title="Giorno di inizio dell'attività (D0)",
         template="plotly_white",
-        height=430,
-        margin=dict(l=10, r=10, t=60, b=10),
-        hovermode="x unified",
-        barmode="overlay",
+        height=450,
+        margin=dict(l=15, r=15, t=60, b=20),
+        xaxis=dict(
+            type="category",
+            rangeslider=dict(visible=False), # Nasconde la barra di scorrimento finanziaria inferiore
+            gridcolor="rgba(255,255,255,1)",
+        ),
+        yaxis=dict(
+            gridcolor="rgba(241,245,249,1)", # Linee della griglia orizzontale nitide e leggere
+            zeroline=False
+        ),
+        plot_bgcolor="#f8fafc", # Colore di sfondo dell'area del grafico
     )
     return fig
 
 # -----------------------------
-# GANTT & LOSS (kept)
+# GANTT & LOSS DETAILED PLOTS
 # -----------------------------
 def aggregate_gantt(member_logs: List[pd.DataFrame]) -> pd.DataFrame:
     if not member_logs:
@@ -865,7 +864,7 @@ def plot_daily_prod_loss_band(prod_daily: pd.DataFrame) -> go.Figure:
     return fig
 
 # -----------------------------
-# TIME ESTIMATE (fast)
+# TIME ESTIMATE
 # -----------------------------
 def format_time_estimate(seconds: float) -> str:
     if seconds <= 0:
@@ -884,9 +883,9 @@ def heuristic_estimate_seconds(n_members: int, n_days: int, horizon_hours: int, 
     return ops / 45000.0
 
 # -----------------------------
-# UI
+# UI STREAMLIT APP
 # -----------------------------
-st.title("WTG Main Component – Profit Optimizer (Open‑Meteo Ensemble)")
+st.title("WTG Main Component – Loss Minimizer (Open‑Meteo Ensemble)")
 
 with st.sidebar:
     st.header("A) Parametri economici & operativi")
@@ -923,7 +922,7 @@ with st.sidebar:
     st.header("E) Debug")
     use_mock = st.toggle("Usa Mock Data (solo debug)", value=False)
 
-# Validate shift
+# Validazione turni
 try:
     t0 = to_time(shift_start)
     t1 = to_time(shift_end)
@@ -943,7 +942,7 @@ params = CraneParams(
     shift_end=shift_end,
 )
 
-# Steps table
+# Tabella attività modificabile
 st.subheader("Attività (step sequenziali)")
 default_steps = pd.DataFrame(
     {
@@ -957,7 +956,7 @@ default_steps = pd.DataFrame(
 )
 steps_df = st.data_editor(default_steps, num_rows="dynamic", use_container_width=True, hide_index=True)
 
-# Parse steps robustly
+# Parsing robusto delle attività
 steps: List[Step] = []
 for _, r in steps_df.iterrows():
     name = str(r.get("Step", "")).strip()
@@ -981,7 +980,7 @@ if len(steps) == 0:
 
 total_work_h = float(sum(s.duration_h for s in steps))
 
-# Load meteo
+# Caricamento meteo sincrono
 with st.spinner("Caricamento forecast Open‑Meteo..."):
     if use_mock:
         df = generate_mock_open_meteo_ensemble(days=int(forecast_days), n_members=20, include_gusts=include_gusts)
@@ -1006,7 +1005,7 @@ if not wind_cols_all:
     st.error("Non ho trovato colonne wind ensemble nel dataset.")
     st.stop()
 
-# --- Selezione Intelligente dei Membri (Logica dei Salti / Campionamento Uniforme) ---
+# Campionamento intelligente dei membri dell'ensemble
 n_members_available = len(wind_cols_all)
 if use_all_members:
     wind_cols_use = wind_cols_all
@@ -1021,113 +1020,146 @@ else:
         indices = sorted(list(set(indices)))
         wind_cols_use = [wind_cols_all[i] for i in indices]
         gust_cols_use = [gust_cols_all[i] for i in indices] if gust_cols_all is not None else None
-        st.info(f"💡 Campionamento Ensemble attivo: estratti {len(wind_cols_use)} membri distribuiti sull'intero fascio per catturare gli scenari estremi.")
+        st.info(f"💡 Campionamento Ensemble attivo: estratti {len(wind_cols_use)} membri distribuiti sul fascio.")
 
 forecast_start = df["timestamp"].min()
 forecast_end = df["timestamp"].max()
 earliest_ts = pd.Timestamp(earliest_day)
 horizon_start = max(forecast_start.normalize(), clamp_date_to_forecast(earliest_ts, forecast_start, forecast_end))
 
-# --- ALL DAY SIMULATIONS (No rigid st.stop filter) ---
+# Grafici di contesto meteo/produzione (sempre visibili ed aggiornati real-time)
+st.markdown("### Grafici Meteo & Produzione Prevista")
+st.plotly_chart(plot_wind_speed_ensemble(df, wind_cols_use), use_container_width=True)
+st.plotly_chart(plot_expected_production(df, wind_cols_use), use_container_width=True)
+
+# --- CONTROLLO ED ESECUZIONE SIMULAZIONE (PULSANTE MANUALE) ---
 all_days = pd.date_range(start=horizon_start, end=forecast_end.normalize(), freq="1D")
 
 if len(all_days) == 0:
     st.error("Nessun giorno D0 analizzabile nell'orizzonte forecast.")
     st.stop()
 
-sims = {}
 total_sims = len(all_days)
 horizon_hours = int((forecast_end - horizon_start).total_seconds() / 3600)
 est_sec = heuristic_estimate_seconds(len(wind_cols_use), total_sims, horizon_hours, total_work_h)
 
-prog_bar = st.progress(0.0, text=f"Simulazione in corso... Tempo stimato: {format_time_estimate(est_sec)}")
-t_start = time.time()
+# Generazione dell'Hash MD5 per verificare modifiche agli input
+cur_hash = hashlib.md5(json.dumps({
+    "m": len(wind_cols_use), "d": [str(x) for x in all_days],
+    "s": [(s.name, s.duration_h, s.wind_thr, s.requires_crane) for s in steps],
+    "p": [mob_demob, op_std, op_fest, standby, shift_start, shift_end],
+    "ra": risk_aversion
+}, sort_keys=True).encode()).hexdigest()
 
-for i, d0 in enumerate(all_days):
-    d0_ts = pd.Timestamp(d0)
-    res = simulate_single_start_day_profit(
-        df=df,
-        horizon_start=horizon_start,
-        start_day=d0_ts,
-        wind_cols=wind_cols_use,
-        gust_cols=gust_cols_use,
-        steps=steps,
-        params=params,
-        rated_mw=2.0
-    )
-    sims[d0_ts] = res
-    prog_bar.progress(float((i + 1) / total_sims))
+if "sims_profit" not in st.session_state: st.session_state["sims_profit"] = None
+if "sims_hash_profit" not in st.session_state: st.session_state["sims_hash_profit"] = None
 
-t_elapsed = time.time() - t_start
-prog_bar.empty()
-st.caption(f"Simulazione completata in {t_elapsed:.2f} secondi ({len(wind_cols_use)} membri, {total_sims} giorni D0).")
+st.subheader("Simulazione Stocastica dell'Impatto Economico")
+c1, c2, c3 = st.columns(3)
+c1.metric("Giorni D0 analizzabili", total_sims)
+c2.metric("Membri ensemble attivi", len(wind_cols_use))
+c3.metric("Simulazioni totali", total_sims * len(wind_cols_use))
+st.info(f"⏱️ **Tempo stimato:** {format_time_estimate(est_sec)}  —  {len(wind_cols_use)} membri × {total_sims} giorni")
 
-summary = compute_daily_summary_profit(sims)
+if st.session_state["sims_profit"] and st.session_state["sims_hash_profit"] != cur_hash:
+    st.warning("⚠️ Parametri operativi o economici modificati. Clicca sul pulsante per ricalcolare i risultati con i nuovi valori.")
 
-if summary.empty:
-    st.error("Nessun dato di sintesi disponibile. Verifica i parametri inseriti.")
-    st.stop()
+# IL PULSANTE DI ESECUZIONE MANUALE
+if st.button("▶ Esegui simulazione", type="primary", use_container_width=True):
+    sims = {}
+    prog_bar = st.progress(0.0, text="Avvio simulazione...")
+    t_start = time.time()
 
-best_d0, scored = choose_optimal_day_profit(summary, risk_aversion=risk_aversion)
+    for i, d0 in enumerate(all_days):
+        d0_ts = pd.Timestamp(d0)
+        res = simulate_single_start_day_profit(
+            df=df,
+            horizon_start=horizon_start,
+            start_day=d0_ts,
+            wind_cols=wind_cols_use,
+            gust_cols=gust_cols_use,
+            steps=steps,
+            params=params,
+            rated_mw=2.0
+        )
+        sims[d0_ts] = res
+        
+        elapsed = time.time() - t_start
+        rem = (elapsed / (i + 1)) * (total_sims - i - 1)
+        prog_bar.progress(float((i + 1) / total_sims),
+                          text=f"D0 {i+1}/{total_sims} — Tempo rimanente stimato: {format_time_estimate(rem)}")
 
-# --- DASHBOARD OUTPUTS ---
-st.header("Risultati Ottimizzazione")
-col1, col2, col3 = st.columns(3)
+    prog_bar.empty()
+    st.session_state["sims_profit"] = sims
+    st.session_state["sims_hash_profit"] = cur_hash
+    st.success(f"✅ Analisi completata in {time.time() - t_start:.2f} secondi.")
 
-if best_d0:
-    row_best = scored[scored["Giorno Inizio (D0)"] == best_d0.date()].iloc[0]
-    col1.metric("Giorno Ottimale Suggerito (D0)", best_d0.strftime("%d/%m/%Y"))
-    col2.metric("Impatto Economico dell'Intervento Atteso", f"{row_best['Profitto Medio €']:,.0f} €")
-    col3.metric("Rischio di Sforamento (Spread)", f"{row_best['Spread (P90-P10) €']:,.0f} €")
+# --- RENDERING RISULTATI (Solo se la simulazione è presente in session_state) ---
+if st.session_state["sims_profit"]:
+    sims = st.session_state["sims_profit"]
+    summary = compute_daily_summary_profit(sims)
+
+    if not summary.empty:
+        best_d0, scored = choose_optimal_day_profit(summary, risk_aversion=risk_aversion)
+
+        st.header("Risultati Ottimizzazione (Minimizzazione della Perdita)")
+        col1, col2, col3 = st.columns(3)
+
+        if best_d0:
+            row_best = scored[scored["Giorno Inizio (D0)"] == best_d0.date()].iloc[0]
+            col1.metric("Giorno Ottimale Suggerito (D0)", best_d0.strftime("%d/%m/%Y"))
+            col2.metric("Minima Perdita Media Attesa", f"{row_best['Perdita Media €']:,.0f} €")
+            col3.metric("Incertezza Meteo (Spread P90-P10)", f"{row_best['Spread (P90-P10) €']:,.0f} €")
+
+        st.subheader("Tabella Comparativa Scenari D0 (Solo completati al 100%)")
+        st.dataframe(
+            scored.style.format(
+                {
+                    "Perdita P10 €": "{:,.2f} €",
+                    "Perdita Media €": "{:,.2f} €",
+                    "Perdita P90 €": "{:,.2f} €",
+                    "Spread (P90-P10) €": "{:,.2f} €",
+                    "Score (min meglio)": "{:,.2f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.markdown("### Analisi Finanziaria del Rischio (Stile Candlestick)")
+        st.plotly_chart(plot_profit_candles(scored), use_container_width=True)
+
+        st.markdown("### Dettaglio D0 selezionato (Gantt medio + perdite fermo)")
+        # Popoliamo il selettore di dettaglio unicamente con i giorni che hanno soddisfatto il vincolo del 100%
+        valid_dates_for_detail = scored["Giorno Inizio (D0)"].tolist()
+        if valid_dates_for_detail:
+            selected = st.selectbox("Seleziona giorno D0 per visualizzare la distribuzione oraria", valid_dates_for_detail, key="sel_d0_detail")
+            sim_sel = sims.get(pd.Timestamp(selected))
+
+            if sim_sel and sim_sel.get("status") == "ok":
+                frac = aggregate_gantt(sim_sel["member_logs"])
+                if not frac.empty:
+                    st.plotly_chart(plot_gantt_fraction(frac), use_container_width=True)
+                prod_daily = compute_prod_loss_daily_for_selected(sim_sel)
+                if not prod_daily.empty:
+                    st.plotly_chart(plot_daily_prod_loss_band(prod_daily), use_container_width=True)
+        else:
+            st.warning("Nessun giorno disponibile per l'analisi di dettaglio.")
+    else:
+        st.error("❌ Nessun giorno D0 analizzato permette il completamento al 100% dell'attività entro i limiti del forecast attuale. Prova a ridurre la durata degli step o ad anticipare il giorno di inizio.")
 else:
-    col1.warning("Nessun giorno D0 ottimale identificato.")
+    st.info("👆 Modifica i parametri desiderati nella barra laterale o la tabella, quindi premi **Esegui simulazione** per generare l'analisi stocastica e i grafici a candela.")
 
-st.subheader("Tabella Comparativa Scenari D0")
-st.dataframe(
-    scored.style.format(
-        {
-            "Profitto P10 €": "{:,.2f} €",
-            "Profitto Medio €": "{:,.2f} €",
-            "Profitto P90 €": "{:,.2f} €",
-            "Spread (P90-P10) €": "{:,.2f} €",
-            "Parziale %": "{:.1f} %",
-            "Penalità parziale media €": "{:,.2f} €",
-            "Score (max meglio)": "{:,.2f}",
-        }
-    ),
-    use_container_width=True,
-    hide_index=True
-)
-
-st.markdown("### Grafici Meteo & Produzione Prevista")
-# Incolonnamento grafico del Vento (sopra) e grafico della Produzione (sotto)
-st.plotly_chart(plot_wind_speed_ensemble(df, wind_cols_use), use_container_width=True)
-st.plotly_chart(plot_expected_production(df, wind_cols_use), use_container_width=True)
-
-st.markdown("### Analisi Finanziaria dell'Orizzonte")
-st.plotly_chart(plot_profit_candles(scored), use_container_width=True)
-
-# Detail selection
-st.markdown("### Dettaglio D0 selezionato (Gantt medio + perdite fermo)")
-selected = st.selectbox("Seleziona giorno D0", [d.date() for d in all_days], key="sel_d0_detail")
-sim_sel = sims.get(pd.Timestamp(selected))
-
-if sim_sel and sim_sel.get("status") == "ok":
-    frac = aggregate_gantt(sim_sel["member_logs"])
-    if not frac.empty:
-        st.plotly_chart(plot_gantt_fraction(frac), use_container_width=True)
-    prod_daily = compute_prod_loss_daily_for_selected(sim_sel)
-    if not prod_daily.empty:
-        st.plotly_chart(plot_daily_prod_loss_band(prod_daily), use_container_width=True)
-
-with st.expander("Note sul concetto di Impatto Economico dell'Intervento", expanded=False):
+with st.expander("Note sulla logica di calcolo dei Costi Isolati & Filtro 100%", expanded=False):
     st.markdown(
         """
-**Periodo di Marcia (horizon_start → D0):** la turbina produce e incassa:  
-Ricavi = PowerCurve(wind) × prezzo orario.
+**Isolamento Economico (Strategia 2):** I grafici e le tabelle mostrano la **Perdita Totale dell'intervento** (espressa come valore positivo). Questa è la somma aritmetica di:
+1. Costo fisso di mobilitazione e smobilitazione della gru (`Mob/Demob`).
+2. Costi operativi e orari della gru (tariffe standard, festive o di standby a seconda dello stato orario del cantiere).
+3. Mancata produzione energetica calcolata $H24$ dal momento dell'interruzione ($D_0$) fino al termine dei lavori.
 
-**Periodo di Fermo (da D0):** ricavo = 0, ma si registra Mancata Produzione H24.
+Il giorno suggerito è quello che **minimizza** questo valore complessivo.
 
-**Gru (Look-Ahead):** calcolata dinamicamente. Se lo step corrente o i successivi richiedono la gru, vengono applicate le tariffe orarie operativi o standby. Se gli step finali non richiedono la gru, i suoi costi si azzerano in anticipo.
+**Filtro di Completamento Restrittivo:** Per evitare che l'algoritmo selezioni gli ultimi giorni del bollettino meteo (sfruttando il fatto che la simulazione finirebbe prima di registrare i costi reali delle attività mancanti), **vengono automaticamente scartati tutti i giorni $D_0$ in cui anche un solo scenario stocastico dell'ensemble lascia il lavoro incompleto**. Il grafico visualizza quindi esclusivamente le finestre temporali d'inizio sicure e totalmente pianificabili.
 """
     )
