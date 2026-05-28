@@ -17,7 +17,7 @@ import streamlit as st
 # CONFIG
 # -----------------------------
 st.set_page_config(
-    page_title="WTG Main Component - Cost Optimizer (Stochastic)",
+    page_title="WTG Main Component - Cost Minimizer (Stochastic)",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -94,9 +94,6 @@ def format_time_estimate(seconds: float) -> str:
 
 
 def heuristic_estimate_seconds(n_members: int, n_days: int, horizon_hours: int, total_work_h: float) -> float:
-    """
-    Stima veloce per non rallentare UI.
-    """
     if n_members <= 0 or n_days <= 0:
         return 0.0
     avg_hours_after_d0 = max(1.0, horizon_hours / 2.0)
@@ -162,7 +159,6 @@ def generate_price_series(ts: pd.Series, seed: int = 7) -> np.ndarray:
     rng = np.random.default_rng(seed)
     hour = ts.dt.hour.values
     dow = ts.dt.dayofweek.values
-
     base = (
         70
         + 10 * np.sin((hour - 6) / 24 * 2 * np.pi)
@@ -301,7 +297,7 @@ def detect_members(df: pd.DataFrame) -> Tuple[List[str], Optional[List[str]]]:
 
 
 # -----------------------------
-# PLOTS: wind & production always available
+# PLOTS: wind & production
 # -----------------------------
 def plot_wind_speed_ensemble(df_view: pd.DataFrame, wind_cols: List[str]) -> go.Figure:
     wind_mat = df_view[wind_cols].to_numpy(dtype=float)
@@ -314,12 +310,10 @@ def plot_wind_speed_ensemble(df_view: pd.DataFrame, wind_cols: List[str]) -> go.
     fig.add_trace(go.Scatter(
         x=df_view["timestamp"], y=p10, mode="lines", line=dict(width=0),
         fill="tonexty", fillcolor="rgba(14,165,233,0.18)", name="P10–P90",
-        hovertemplate="%{x|%d/%m %H:%M}<br>P10: %{y:.2f} m/s<extra></extra>"
     ))
     fig.add_trace(go.Scatter(
         x=df_view["timestamp"], y=mean, mode="lines",
         line=dict(color="rgba(14,165,233,1)", width=2.5), name="Media",
-        hovertemplate="%{x|%d/%m %H:%M}<br>Media: %{y:.2f} m/s<extra></extra>"
     ))
     fig.update_layout(
         title="Velocità vento prevista [m/s] (ensemble)",
@@ -347,12 +341,10 @@ def plot_expected_production(df_view: pd.DataFrame, wind_cols: List[str]) -> go.
     fig.add_trace(go.Scatter(
         x=df_view["timestamp"], y=p10, mode="lines", line=dict(width=0),
         fill="tonexty", fillcolor="rgba(59,130,246,0.18)", name="P10–P90",
-        hovertemplate="%{x|%d/%m %H:%M}<br>P10: %{y:.2f} MW<extra></extra>"
     ))
     fig.add_trace(go.Scatter(
         x=df_view["timestamp"], y=mean, mode="lines",
         line=dict(color="rgba(59,130,246,1)", width=2.5), name="Media",
-        hovertemplate="%{x|%d/%m %H:%M}<br>Media: %{y:.2f} MW<extra></extra>"
     ))
     fig.update_layout(
         title="Produzione prevista [MW] (ensemble + power curve)",
@@ -429,10 +421,6 @@ def op_cost_for_hour(ts: pd.Timestamp, params: CraneParams) -> float:
 
 
 def count_remaining_work_hours(df: pd.DataFrame, d0_ts: pd.Timestamp, params: CraneParams) -> int:
-    """
-    Conteggio ore lavorabili residue (solo ore in turno) da D0 fino a fine forecast.
-    Usa i timestamp orari reali del df.
-    """
     mask = (df["timestamp"] >= d0_ts) & (df["timestamp"] <= df["timestamp"].iloc[-1])
     ts = df.loc[mask, "timestamp"]
     if ts.empty:
@@ -449,13 +437,6 @@ def simulate_single_start_day_cost(
     params: CraneParams,
     rated_mw: float = 2.0
 ) -> Dict:
-    """
-    COSTI SOLO:
-    costo_totale = mob/demob + costi_gru + mancata_produzione (da D0 in poi)
-    - turbina spenta da D0 (sempre) -> perdita H24
-    - costi gru solo se crane_present (look-ahead su requires_crane)
-    - se forecast finisce prima del completamento -> partial=True (nessun inf)
-    """
     df = df.sort_values("timestamp").reset_index(drop=True)
     d0_ts = pd.Timestamp(start_day.date())
 
@@ -523,14 +504,10 @@ def simulate_single_start_day_cost(
                     current_step_started = True
                     if crane_present:
                         c_cost = op_cost_for_hour(ts, params)
-                    else:
-                        c_cost = 0.0
                 else:
                     state = "Standby" if crane_present else "Attesa (no gru)"
                     if crane_present:
                         c_cost = params.standby_cost_eur_h
-                    else:
-                        c_cost = 0.0
 
                 crane_cost += c_cost
 
@@ -552,8 +529,6 @@ def simulate_single_start_day_cost(
             idx += 1
 
         partial = (step_i < len(steps))
-
-        # total cost (objective)
         total_cost = mob_demob_apply + crane_cost + lost_revenue
 
         member_rows.append({
@@ -575,9 +550,6 @@ def simulate_single_start_day_cost(
     }
 
 
-# -----------------------------
-# SUMMARY + OPTIMIZATION (minimize)
-# -----------------------------
 def compute_daily_summary_cost(all_sims: Dict[pd.Timestamp, Dict], structural_infeasible: Dict[pd.Timestamp, bool]) -> pd.DataFrame:
     rows = []
     for d0, sim in all_sims.items():
@@ -608,11 +580,14 @@ def compute_daily_summary_cost(all_sims: Dict[pd.Timestamp, Dict], structural_in
     return pd.DataFrame(rows).sort_values("Giorno Inizio (D0)").reset_index(drop=True)
 
 
-def choose_optimal_day_cost(summary: pd.DataFrame, risk_aversion: float = 0.7) -> Tuple[Optional[pd.Timestamp], pd.DataFrame]:
+def choose_optimal_day_cost(summary: pd.DataFrame, last_possible_start: Optional[pd.Timestamp], risk_aversion: float = 0.7) -> Tuple[Optional[pd.Timestamp], pd.DataFrame]:
     """
     MINIMIZZAZIONE:
     Score = CostoMedio + risk_aversion*Spread
-    (Non escludiamo i D0 impossibili dalla tabella: lo score li renderà tipicamente pessimi perché costi elevati/parziali.)
+
+    Vincoli richiesti:
+    - Non scegliere come "Miglior D0" giorni dopo last_possible_start (anche se plottati e simulati).
+    - "Nessun D0 ottimo" SOLO se, tra i candidati (<= last_possible_start), Probabilità Successo = 0% per tutti.
     """
     s = summary.copy()
     if s.empty:
@@ -620,66 +595,61 @@ def choose_optimal_day_cost(summary: pd.DataFrame, risk_aversion: float = 0.7) -
 
     mean = s["Costo Medio €"].to_numpy(dtype=float)
     spread = np.nan_to_num(s["Spread (P90-P10) €"].to_numpy(dtype=float), nan=0.0)
-
     score = mean + float(risk_aversion) * spread
     s["Score (min meglio)"] = score
 
-    if not np.any(np.isfinite(score)):
+    # Se non abbiamo last_possible_start (perché tutti strutturalmente impossibili),
+    # allora NON scegliamo automaticamente l'ultimo giorno; valutiamo il caso "nessun ottimo" con prob=0.
+    if last_possible_start is None:
+        # se qualcuno ha prob_success > 0, scegli tra tutti; altrimenti None
+        if np.nanmax(s["Probabilità Successo (%)"].to_numpy(dtype=float)) <= 0.0:
+            return None, s
+        best_idx = int(np.nanargmin(s["Score (min meglio)"].to_numpy(dtype=float)))
+        best_day = pd.Timestamp(s.loc[best_idx, "Giorno Inizio (D0)"])
+        return best_day, s
+
+    # candidati solo fino all'ultimo giorno possibile
+    candidates = s[pd.to_datetime(s["Giorno Inizio (D0)"]) <= pd.Timestamp(last_possible_start.date())].copy()
+    if candidates.empty:
         return None, s
 
-    best_idx = int(np.nanargmin(score))
-    best_day = pd.Timestamp(s.loc[best_idx, "Giorno Inizio (D0)"])
+    # condizione "nessun ottimo" (casi 1 e 2 come da tua definizione)
+    if np.nanmax(candidates["Probabilità Successo (%)"].to_numpy(dtype=float)) <= 0.0:
+        return None, s
+
+    best_idx = int(np.nanargmin(candidates["Score (min meglio)"].to_numpy(dtype=float)))
+    best_day = pd.Timestamp(candidates.iloc[best_idx]["Giorno Inizio (D0)"])
     return best_day, s
 
 
-# -----------------------------
-# CANDLE PLOT (exclude structural infeasible ONLY here)
-# -----------------------------
-def plot_cost_candles(summary_scored: pd.DataFrame) -> go.Figure:
-    if summary_scored.empty:
+def plot_cost_candles(summary_for_plot: pd.DataFrame) -> go.Figure:
+    if summary_for_plot.empty:
         return go.Figure()
 
-    dfp = summary_scored.copy().sort_values("Giorno Inizio (D0)")
+    dfp = summary_for_plot.copy().sort_values("Giorno Inizio (D0)")
     x = dfp["Giorno Inizio (D0)"].astype(str)
     p10 = dfp["Costo P10 €"].to_numpy(dtype=float)
     p90 = dfp["Costo P90 €"].to_numpy(dtype=float)
     mean = dfp["Costo Medio €"].to_numpy(dtype=float)
-    score = dfp["Score (min meglio)"].to_numpy(dtype=float)
-
-    # normalize score: best (lowest) -> green
-    smin = np.nanmin(score) if np.any(np.isfinite(score)) else 0.0
-    smax = np.nanmax(score) if np.any(np.isfinite(score)) else 1.0
-    denom = (smax - smin) if (smax - smin) > 1e-9 else 1.0
-    norm = 1.0 - (score - smin) / denom  # invert -> best=1
-
-    colors = []
-    for t in norm:
-        if not np.isfinite(t):
-            colors.append("rgba(148,163,184,0.8)")
-        else:
-            r = int(220 + (34 - 220) * t)
-            g = int(38 + (197 - 38) * t)
-            b = int(38 + (94 - 38) * t)
-            colors.append(f"rgba({r},{g},{b},0.85)")
 
     body = p90 - p10
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=x, y=body, base=p10,
-        marker=dict(color=colors),
+        marker=dict(color="rgba(99,102,241,0.35)"),
         name="Intervallo P10–P90",
         hovertemplate="D0: %{x}<br>P10: %{base:,.0f} €<br>P90: %{y+base:,.0f} €<extra></extra>"
     ))
     fig.add_trace(go.Scatter(
         x=x, y=mean, mode="lines+markers",
-        line=dict(color="rgba(15,23,42,0.9)", width=2),
-        marker=dict(size=7, color=colors),
+        line=dict(color="rgba(99,102,241,1)", width=2),
+        marker=dict(size=6, color="rgba(99,102,241,1)"),
         name="Costo medio",
         hovertemplate="D0: %{x}<br>Costo medio: %{y:,.0f} €<extra></extra>"
     ))
     fig.update_layout(
-        title="Costo totale vs D0 (candela P10–P90, colore per bontà)",
+        title="Costo totale vs D0 (candela P10–P90) — esclusi solo D0 strutturalmente impossibili",
         xaxis_title="Giorno di inizio D0",
         yaxis_title="Costo Totale (€)",
         template="plotly_white",
@@ -691,9 +661,6 @@ def plot_cost_candles(summary_scored: pd.DataFrame) -> go.Figure:
     return fig
 
 
-# -----------------------------
-# GANTT
-# -----------------------------
 def aggregate_gantt(member_logs: List[pd.DataFrame]) -> pd.DataFrame:
     if not member_logs:
         return pd.DataFrame()
@@ -747,7 +714,7 @@ with st.sidebar:
     latitude = st.number_input("Latitudine", value=41.5)
     longitude = st.number_input("Longitudine", value=15.2)
     model = st.selectbox("Modello", options=["gfs_seamless", "icon_seamless", "ecmwf_ifs04"])
-    forecast_days = st.slider("Giorni forecast", 3, 16, 10)
+    forecast_days = st.slider("Giorni forecast (richiesti)", 3, 16, 10)
     include_gusts = st.toggle("Usa raffiche", value=True)
 
     st.divider()
@@ -826,7 +793,7 @@ if not steps:
     st.error("Inserisci almeno uno step valido (Durata > 0 e Wind Threshold > 0).")
     st.stop()
 
-total_work_h = float(sum(s.duration_h for s in steps))
+required_work_h = float(sum(s.duration_h for s in steps))
 
 # Load meteo
 with st.spinner("Caricamento dati meteo..."):
@@ -849,15 +816,9 @@ gust_cols_use = gust_cols_all[:len(wind_cols_use)] if gust_cols_all else None
 
 forecast_start = df["timestamp"].min()
 forecast_end = df["timestamp"].max()
-
 horizon_start = max(forecast_start.normalize(), pd.Timestamp(earliest_day))
 
-# ALL D0 days (never excluded from simulation)
-all_days = pd.date_range(
-    start=horizon_start.normalize(),
-    end=forecast_end.normalize(),
-    freq="1D"
-)
+all_days = pd.date_range(start=horizon_start.normalize(), end=forecast_end.normalize(), freq="1D")
 all_days = list(all_days)
 if not all_days:
     st.error("Nessun giorno D0 disponibile nell'intervallo forecast.")
@@ -876,32 +837,41 @@ with c2:
 
 st.plotly_chart(plot_expected_production(df_view, wind_cols_use), use_container_width=True)
 
-# Structural infeasible map (work-hours insufficient regardless of forecast)
-required_work_h = float(sum(s.duration_h for s in steps))
+# Structural infeasible map + last possible start
 structural_infeasible = {}
+available_work_h_map = {}
+
 for d0 in all_days:
     d0_ts = pd.Timestamp(d0.date())
-    # if d0 not aligned to df, use searchsorted
     idx0 = int(df["timestamp"].searchsorted(d0_ts))
     if idx0 >= len(df):
         structural_infeasible[pd.Timestamp(d0)] = True
+        available_work_h_map[pd.Timestamp(d0)] = 0
         continue
     d0_aligned = df.at[idx0, "timestamp"]
-    available_work_h = count_remaining_work_hours(df, d0_aligned, params)
-    structural_infeasible[pd.Timestamp(d0)] = (available_work_h < required_work_h)
+    avail = count_remaining_work_hours(df, d0_aligned, params)
+    available_work_h_map[pd.Timestamp(d0)] = avail
+    structural_infeasible[pd.Timestamp(d0)] = (avail < required_work_h)
+
+feasible_days_only = [pd.Timestamp(d) for d in all_days if not structural_infeasible.get(pd.Timestamp(d), False)]
+last_possible_start = pd.Timestamp(feasible_days_only[-1]) if feasible_days_only else None
+
+if last_possible_start is not None:
+    st.caption(f"Ultimo D0 strutturalmente completabile (ore turno sufficienti): {last_possible_start.date()}")
+else:
+    st.caption("Ultimo D0 strutturalmente completabile: nessuno (ore turno insufficienti in tutto l’orizzonte)")
 
 # Time estimate + run
 st.subheader("Simulazione stocastica (Costi totali)")
 
 horizon_hours = int((forecast_end - horizon_start).total_seconds() / 3600) + 1
-est_sec = heuristic_estimate_seconds(len(wind_cols_use), len(all_days), horizon_hours, total_work_h)
+est_sec = heuristic_estimate_seconds(len(wind_cols_use), len(all_days), horizon_hours, required_work_h)
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Giorni D0 simulati", len(all_days))
 m2.metric("Membri ensemble usati", len(wind_cols_use))
 m3.metric("Orizzonte (ore)", horizon_hours)
 m4.metric("Simulazioni totali", len(all_days) * len(wind_cols_use))
-
 st.info(f"⏱️ Tempo stimato: {format_time_estimate(est_sec)} ({len(wind_cols_use)} membri × {len(all_days)} giorni)")
 
 cur_hash = hashlib.md5(json.dumps({
@@ -927,7 +897,6 @@ if run_clicked:
     sims = {}
     prog = st.progress(0.0, text="Avvio...")
     t_start = time.perf_counter()
-
     for i, d0 in enumerate(all_days):
         sims[pd.Timestamp(d0)] = simulate_single_start_day_cost(
             df=df,
@@ -938,61 +907,77 @@ if run_clicked:
             params=params
         )
         prog.progress((i + 1) / len(all_days), text=f"D0 {i+1}/{len(all_days)}")
-
     prog.empty()
     st.session_state["sims_cost"] = sims
     st.session_state["sims_hash_cost"] = cur_hash
     st.success(f"✅ Simulazione completata in {format_time_estimate(time.perf_counter() - t_start)}.")
 
-# Render results
 if st.session_state["sims_cost"] is None:
     st.info("👆 Premi **Esegui simulazione** per ottenere i risultati.")
     st.stop()
 
 sims = st.session_state["sims_cost"]
 summary = compute_daily_summary_cost(sims, structural_infeasible)
-best_d0, scored = choose_optimal_day_cost(summary, risk_aversion=risk_aversion)
+best_d0, scored = choose_optimal_day_cost(summary, last_possible_start, risk_aversion=risk_aversion)
 
 st.header("Risultati (Costi totali + Probabilità di completamento)")
 
 c1, c2, c3, c4 = st.columns(4)
-if best_d0 is not None and not scored.empty:
+if best_d0 is None:
+    c1.metric("Miglior D0", "Nessun D0 ottimo")
+    c2.metric("Motivo", "Probabilità completamento = 0% per tutte le date candidabili")
+    c3.metric("Ore richieste", f"{required_work_h:.0f} h turno")
+    if last_possible_start is None:
+        c4.metric("Ultimo D0 possibile", "Nessuno")
+    else:
+        c4.metric("Ultimo D0 possibile", str(last_possible_start.date()))
+else:
     rb = scored[scored["Giorno Inizio (D0)"] == best_d0.date()].iloc[0]
     c1.metric("Miglior D0 (min costo medio)", best_d0.strftime("%d/%m/%Y"))
     c2.metric("Costo medio atteso", f"{rb['Costo Medio €']:,.0f} €")
     c3.metric("Probabilità successo", f"{rb['Probabilità Successo (%)']:.1f} %")
-    c4.metric("Spread (P90-P10)", f"{rb['Spread (P90-P10) €']:,.0f} €")
-else:
-    st.warning("Impossibile determinare un D0 ottimale.")
+    c4.metric("Ultimo D0 possibile", str(last_possible_start.date()) if last_possible_start is not None else "Nessuno")
 
-st.subheader("Tabella completa (tutti i D0 simulati)")
+st.subheader("Tabella completa (tutti i D0 simulati, formattazione uniforme)")
 st.dataframe(
-    scored.style.format({
+    scored[[
+        "Giorno Inizio (D0)",
+        "Probabilità Successo (%)",
+        "Costo P10 €",
+        "Costo Medio €",
+        "Costo P90 €",
+        "Spread (P90-P10) €",
+        "Strutturalmente impossibile",
+    ]].style.format({
         "Probabilità Successo (%)": "{:.1f}",
         "Costo P10 €": "{:,.0f}",
         "Costo Medio €": "{:,.0f}",
         "Costo P90 €": "{:,.0f}",
         "Spread (P90-P10) €": "{:,.0f}",
-        "Score (min meglio)": "{:,.0f}",
-    }).background_gradient(subset=["Score (min meglio)"], cmap="RdYlGn_r"),
+    }),
     use_container_width=True,
     hide_index=True
 )
 
-# Candlestick-like plot: exclude only structural infeasible days
 st.subheader("Costo totale vs D0 (grafico a candele: esclusi solo i D0 strutturalmente impossibili)")
 plot_df = scored[~scored["Strutturalmente impossibile"]].copy()
 if plot_df.empty:
-    st.warning("Nessun D0 è plottabile: tutti i D0 risultano strutturalmente impossibili (ore lavorative residue insufficienti).")
+    st.warning("Nessun D0 è plottabile: tutti i D0 risultano strutturalmente impossibili (ore turno insufficienti).")
 else:
-    # recompute score ranking only for plotted points to color properly
-    _, plot_scored = choose_optimal_day_cost(plot_df, risk_aversion=risk_aversion)
-    st.plotly_chart(plot_cost_candles(plot_scored), use_container_width=True)
+    st.plotly_chart(plot_cost_candles(plot_df), use_container_width=True)
 
-# Allow selection of ANY day (including excluded from candlestick)
 st.subheader("Dettaglio D0 selezionato (anche se non plottabile nel grafico a candele)")
 selected = st.selectbox("Seleziona D0", [d.date() for d in all_days], key="sel_d0_detail")
 sim_sel = sims.get(pd.Timestamp(selected))
+
+sel_ts = pd.Timestamp(selected)
+sel_infeasible = bool(structural_infeasible.get(sel_ts, False))
+sel_avail = available_work_h_map.get(sel_ts, 0)
+
+st.caption(
+    f"D0 selezionato: {'STRUTTURALMENTE IMPOSSIBILE' if sel_infeasible else 'strutturalmente completabile'} "
+    f"(ore turno disponibili: {sel_avail} vs richieste: {required_work_h:.0f})"
+)
 
 if sim_sel and sim_sel.get("status") == "ok":
     mr = sim_sel["member_results"]
