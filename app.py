@@ -65,7 +65,6 @@ def calcola_mancata_produzione(v_vento):
 
 # --- 2. DOWNLOAD DATI IN PARALLELO CORRETTO ---
 def fetch_forecast_data(lat, lon, model_api, giorni, n_membri, max_m):
-    # Logica di Campionamento Alternato perfettamente implementata
     passo = max(1, max_m // n_membri)
     membri_scelti = [i for i in range(0, max_m, passo)][:n_membri]
     
@@ -108,16 +107,14 @@ def fetch_historical_data(lat, lon, data_d0):
         hourly_data = res.get("hourly", {})
         
         v_data = hourly_data.get("windspeed_100m", hourly_data.get("windspeed_10m", []))
-        g_data = hourly_data.get("wind_gusts_10m", hourly_data.get("windgusts_10m", [])) # Accetta entrambe le varianti API
+        g_data = hourly_data.get("windgusts_10m", [])
         time_seq = pd.to_datetime(hourly_data.get("time", []))
         
         if res.get("hourly_units", {}).get("windspeed_100m", "km/h") == "km/h":
             v_data = [v / 3.6 for v in v_data]
             g_data = [g / 3.6 for g in g_data]
             
-        # Qui mappiamo i nomi che poi useremo nella simulazione
         df_anno = pd.DataFrame({"vento": v_data, "raffica": g_data, "anno": anno}, index=time_seq)
-            
         df_storico_lista.append(df_anno)
         
     return pd.concat(df_storico_lista)
@@ -187,27 +184,29 @@ if st.button("🚀 Avvia Ottimizzazione", disabled=(giorni_d0_validi <= 0)):
                             anni_disponibili = historical_data["anno"].unique()
                             storico_anno_scelto = np.random.choice(anni_disponibili)
                         
+                        # --- GESTIONE DI SICUREZZA PER GLI ANNI BISESTILI INTEGRATA ---
+                        giorno_target = current_time.day
+                        if current_time.month == 2 and current_time.day == 29:
+                            is_bisestile = (storico_anno_scelto % 4 == 0 and storico_anno_scelto % 100 != 0) or (storico_anno_scelto % 400 == 0)
+                            if not is_bisestile:
+                                giorno_target = 28
+                        
                         tempo_mc = pd.Timestamp(datetime.datetime.combine(
-                            datetime.date(storico_anno_scelto, current_time.month, current_time.day),
+                            datetime.date(int(storico_anno_scelto), int(current_time.month), int(giorno_target)),
                             current_time.time()
                         )) + datetime.timedelta(hours=delta_ore_mc)
                         
-                        if tempo_mc not in historical_data.index:
-                            tempo_mc = historical_data[historical_data["anno"] == storico_anno_scelto].index[0]
-                            delta_ore_mc = 0
-                            
-                        # Forza il timestamp ad essere allineato all'ora esatta senza minuti/secondi
+                        # Forza il timestamp ad essere allineato all'ora esatta
                         tempo_mc = tempo_mc.floor('h')
                         
                         if tempo_mc not in historical_data.index:
                             tempo_mc = historical_data[historical_data["anno"] == storico_anno_scelto].index[0]
                             delta_ore_mc = 0
                             
-                        # Estrazione corretta usando i nomi colonna mappati ("vento" e "raffica")
+                        # --- CORREZIONE VARIABILI STORICHE INTEGRATA ---
                         v_ora = historical_data.loc[tempo_mc, "vento"]
-                        g_ora = historical_data.loc[tempo_mc, "raffica"] 
+                        g_ora = historical_data.loc[tempo_mc, "raffica"]
                         is_forecast_flag = False
-                        delta_ore_mc += 1
                         delta_ore_mc += 1
                     
                     log_vento_m.append(v_ora)
