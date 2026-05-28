@@ -659,15 +659,20 @@ def simulate_single_start_day_profit(
         "member_logs": member_logs,
     }
 
-def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataFrame:
+def def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataFrame:
     rows = []
     for d0, sim in all_sims.items():
         if sim.get("status") != "ok":
             continue
         mr = sim["member_results"]
 
-        # FILTRO DI COMPLETAMENTO RESTRITTIVO: Solo giorni D0 in cui l'attività giunge al 100% in TUTTI i membri
-        if mr["partial"].any():
+        # --- FILTRO FLESSIBILE ---
+        # Calcola la frazione di membri rimasti a metà (lavoro parziale)
+        quota_incompleti = mr["partial"].mean() 
+        
+        # Se più del 20% dei modelli stocastici prevede un fallimento/ritardo imprevisto, 
+        # consideriamo la giornata non pianificabile operativamente.
+        if quota_incompleti > 0.20: 
             continue
 
         costi = mr["profit_net_eur"].to_numpy(dtype=float)
@@ -685,6 +690,20 @@ def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataF
                 "Spread (P90-P10) €": spread,
             }
         )
+
+    # Gestione di emergenza se nessuna giornata supera il filtro impostato
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Giorno Inizio (D0)", 
+            "Perdita P10 €", 
+            "Perdita Media €", 
+            "Perdita P90 €", 
+            "Spread (P90-P10) €"
+        ])
+
+    # Creazione del DataFrame finale ordinato cronologicamente
+    out = pd.DataFrame(rows).sort_values("Giorno Inizio (D0)")
+    return out.reset_index(drop=True)
 
     # Gestione del caso in cui nessuna giornata superi il filtro
     if not rows:
