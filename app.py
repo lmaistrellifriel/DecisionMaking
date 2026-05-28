@@ -157,17 +157,12 @@ def generate_price_series(ts: pd.Series, seed: int = 7) -> np.ndarray:
     return np.round(price, 2)
 
 # -----------------------------
-# OPEN-METEO: FETCH ENSEMBLE (CORRETTA E ROBUSTA)
+# OPEN-METEO: FETCH ENSEMBLE
 # -----------------------------
 OPEN_METEO_ENSEMBLE_ENDPOINT = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
 def _extract_member_cols(hourly: dict, base_name: str) -> List[str]:
-    """
-    Cerca nel dizionario hourly tutte le chiavi associate ai membri ensemble 
-    per una determinata variabile di base (es. wind_speed_10m, wind_speed_80m, ecc.)
-    """
     keys = list(hourly.keys())
-    # Questa regex intercetta sia "wind_speed_80m_member_1" sia "wind_speed_80m_member1" o varianti con spazi/underscore
     patt = re.compile(rf"^{re.escape(base_name)}_?member[\s_]?(\d+)$")
     found = []
     for k in keys:
@@ -186,9 +181,8 @@ def fetch_open_meteo_ensemble(
     include_gusts: bool,
     timezone: str = "auto",
 ) -> pd.DataFrame:
-    
-    # Chiediamo sia 80m che 10m (o 100m se preferisci) per avere un fallback se ECMWF non ha gli 80m
-    hourly_vars = ["wind_speed_80m", "wind_speed_10m"]
+    # Chiediamo 80m, 100m (fallback ottimo per ECMWF) e 10m per massima robustezza multipiattaforma
+    hourly_vars = ["wind_speed_80m", "wind_speed_100m", "wind_speed_10m"]
     if include_gusts:
         hourly_vars.append("wind_gusts_10m")
 
@@ -212,53 +206,58 @@ def fetch_open_meteo_ensemble(
     times = pd.to_datetime(hourly["time"])
     df = pd.DataFrame({"timestamp": times})
 
-    # --- FALLBACK DINAMICO PER I MEMBRI DEL VENTO ---
-    # Proviamo prima a cercare i membri a 80m (ottimali per WTG)
+    # --- CASCATA FALLBACK MEMBRI ENSEMBLE VENTO ---
     wind_keys = _extract_member_cols(hourly, "wind_speed_80m")
     var_usata = "wind_speed_80m"
     
-    # Se il modello (come ECMWF) non restituisce i membri a 80m, facciamo fallback sui 10m
     if not wind_keys:
+        # Se mancano gli 80m (tipico di ECMWF IFS), ripieghiamo sui 100m che sono eccellenti per quote hub
+        wind_keys = _extract_member_cols(hourly, "wind_speed_100m")
+        var_usata = "wind_speed_100m"
+        
+    if not wind_keys:
+        # Estrema ratio sui 10 metri
         wind_keys = _extract_member_cols(hourly, "wind_speed_10m")
         var_usata = "wind_speed_10m"
-        
-    # Se non troviamo nulla nemmeno a 10m, facciamo una ricerca generica su qualsiasi chiave contenga "_member"
+
     if not wind_keys:
-        # Cerchiamo se ci sono chiavi legate al vento di qualsiasi tipo (es. a 100m o generiche)
-        chiavi_vento = [k for k in hourly.keys() if "wind_speed" in k]
-        for cv in chiavi_vento:
-            # Estraiamo la radice (es. "wind_speed_100m" dal nome completo del membro)
-            radice = cv.split("_member")[0]
+        # Scansione dinamica disperata su qualsiasi chiave che contenga 'wind_speed'
+        chiavi_alternative = [k for k in hourly.keys() if "wind_speed" in k]
+        for ca in chiavi_alternative:
+            radice = ca.split("_member")[0]
             wind_keys = _extract_member_cols(hourly, radice)
             if wind_keys:
                 var_usata = radice
                 break
 
-    # Se dopo tutti i tentativi non troviamo traccia di membri ensemble
     if not wind_keys:
         raise ValueError(
-            f"Non trovo membri ensemble di tipo 'wind_speed' nella risposta Open-Meteo per il modello '{model}'. "
-            f"Chiavi ricevute dall'API: {list(hourly.keys())}"
+            f"Impossibile mappare membri ensemble di tipo 'wind_speed' per il modello '{model}'. "
+            f"Variabili ritornate dall'API: {list(hourly.keys())}"
         )
 
-    # Popoliamo il DataFrame standardizzando il nome della colonna a 'wind_speed_80m_member_X' 
-    # per non rompere il resto dell'applicazione di simulazione
+    # Standardizziamo le colonne iniettate nel DF con il nome atteso dal codice di simulazione
     for i, k in enumerate(wind_keys):
         df[f"wind_speed_80m_member_{i}"] = pd.to_numeric(hourly[k], errors="coerce")
 
-    # --- ESTRAZIONE RAFFICHE (GUSTS) ---
+    # --- CASCATA FALLBACK MEMBRI ENSEMBLE RAFFICHE ---
     gust_keys = _extract_member_cols(hourly, "wind_gusts_10m") if include_gusts else []
+    if include_gusts and not gust_keys:
+        # Se mancano le raffiche a 10m, verifichiamo se esistono ad altre quote
+        chiavi_gust = [k for k in hourly.keys() if "wind_gusts" in k]
+        for cg in chiavi_gust:
+            radice = cg.split("_member")[0]
+            gust_keys = _extract_member_cols(hourly, radice)
+            if gust_keys:
+                break
+
     if include_gusts and gust_keys:
         for i, k in enumerate(gust_keys):
-            # Protezione nel caso in cui il numero di membri delle raffiche differisca da quelli del vento accelerato
             if i < len(wind_keys):
                 df[f"wind_gusts_10m_member_{i}"] = pd.to_numeric(hourly[k], errors="coerce")
 
-    # Generiamo la serie dei prezzi orari fittizi basandoci sui timestamp estratti
     df["price_eur_mwh"] = generate_price_series(df["timestamp"])
-    
     return df
-
 
 # -----------------------------
 # MOCK DATA
@@ -276,7 +275,6 @@ def generate_mock_open_meteo_ensemble(
 
     idx = pd.date_range(start=pd.to_datetime(start), periods=int(days * 24), freq="1h")
     df = pd.DataFrame({"timestamp": idx})
-
     df["price_eur_mwh"] = generate_price_series(df["timestamp"], seed=seed + 1)
 
     hour = df["timestamp"].dt.hour.values
@@ -374,12 +372,12 @@ def plot_wind_speed_ensemble(df_view: pd.DataFrame, wind_cols: List[str]) -> go.
             y=mean,
             mode="lines",
             line=dict(color="rgba(14, 165, 233, 1)", width=2.8),
-            name="Velocità vento media (80m)",
+            name="Velocità vento media",
             hovertemplate="%{x|%d/%m %H:%M}<br>Media: %{y:.2f} m/s<extra></extra>",
         )
     )
     fig.update_layout(
-        title="Velocità del vento prevista a 80m [m/s] (media ensemble + banda P10–P90)",
+        title="Velocità del vento prevista [m/s] (media ensemble + banda P10–P90)",
         xaxis_title="Tempo",
         yaxis_title="Vento [m/s]",
         template="plotly_white",
@@ -530,7 +528,6 @@ def simulate_single_start_day_profit(
     for m, wind_col in enumerate(wind_cols):
         gust_col = gust_cols[m] if gust_cols is not None else None
 
-        # --- Periodo di Fermo (dal D0) ---
         step_i = 0
         remaining = float(steps[0].duration_h) if steps else 0.0
         current_step_started = False
@@ -635,14 +632,13 @@ def simulate_single_start_day_profit(
         if partial and remaining_work_h > 0:
             penalty_eur = (avg_loss_per_hour * calendar_hours_remaining) + (avg_crane_per_shift_hour * remaining_work_h)
 
-        # STRATEGIA 2: Calcoliamo la PERDITA TOTALE dell'intervento (valore positivo).
-        # Il giorno migliore sarà quello che MINIMIZZA questa perdita complessiva.
+        # STRATEGIA 2: Perdita Totale dell'Intervento (valore positivo da minimizzare)
         costo_totale_intervento = mob_demob_apply + crane_cost + lost_revenue
 
         member_rows.append(
             {
                 "member": m,
-                "profit_net_eur": costo_totale_intervento,  # Mappato su questa chiave storica per retrocompatibilità interna
+                "profit_net_eur": costo_totale_intervento,
                 "mob_demob_eur": mob_demob_apply,
                 "crane_cost_eur": crane_cost,
                 "lost_revenue_eur": lost_revenue,
@@ -670,8 +666,7 @@ def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataF
             continue
         mr = sim["member_results"]
 
-        # FILTRO DI COMPLETAMENTO RESTRITTIVO:
-        # Escludiamo completamente i giorni D0 in cui anche un solo membro/scenario ensemble non completa i lavori
+        # FILTRO DI COMPLETAMENTO RESTRITTIVO: Solo giorni D0 in cui l'attività giunge al 100% in TUTTI i membri
         if mr["partial"].any():
             continue
 
@@ -702,7 +697,6 @@ def choose_optimal_day_profit(summary: pd.DataFrame, risk_aversion: float = 0.7)
     mean = s["Perdita Media €"].to_numpy(dtype=float)
     spread = s["Spread (P90-P10) €"].to_numpy(dtype=float)
 
-    # Più la perdita è alta, peggiore è lo scenario. Lo spread aumenta il rischio e quindi peggiora il punteggio.
     score = mean + float(risk_aversion) * np.nan_to_num(spread, nan=0.0)
     s["Score (min meglio)"] = score
 
@@ -728,9 +722,6 @@ def plot_profit_candles(summary_scored: pd.DataFrame) -> go.Figure:
     dfp = summary_scored.copy().sort_values("Giorno Inizio (D0)")
     x = dfp["Giorno Inizio (D0)"].astype(str)
     
-    # Costruiamo Open e Close fittizi centrati sulla Media per forzare la colorazione alternata del corpo:
-    # Se il costo di oggi cala rispetto a ieri -> Azzurro (Miglioramento)
-    # Se il costo di oggi aumenta rispetto a ieri -> Arancione (Peggioramento)
     opens = []
     closes = []
 
@@ -738,19 +729,18 @@ def plot_profit_candles(summary_scored: pd.DataFrame) -> go.Figure:
         current_mean = dfp.iloc[i]["Perdita Media €"]
         prev_mean = dfp.iloc[i-1]["Perdita Media €"] if i > 0 else current_mean
         
-        spessore = current_mean * 0.03  # Spessore visivo del blocco candela centrale (±3%)
+        spessore = current_mean * 0.03
         if current_mean <= prev_mean:
-            # Ribasso del costo: Open è sopra, Close è sotto -> Colore Azzurro
+            # Ribasso del costo rispetto a ieri -> Azzurro
             opens.append(current_mean + spessore)
             closes.append(current_mean - spessore)
         else:
-            # Rialzo del costo: Open è sotto, Close è sopra -> Colore Arancione
+            # Rialzo del costo rispetto a ieri -> Arancione
             opens.append(current_mean - spessore)
             closes.append(current_mean + spessore)
 
     fig = go.Figure()
 
-    # Utilizzo della struttura go.Candlestick nativa per replicare lo stile ombra verticale sottile di image_af30c0.png
     fig.add_trace(
         go.Candlestick(
             x=x,
@@ -769,15 +759,14 @@ def plot_profit_candles(summary_scored: pd.DataFrame) -> go.Figure:
         )
     )
 
-    # Definizione esatta dei colori del mockup dell'utente
+    # Stile esatto image_af30c0.png
     fig.update_traces(
-        increasing=dict(fillcolor="#f59e0b", line=dict(color="#f59e0b", width=1)), # Arancione per rialzi di costo
-        decreasing=dict(fillcolor="#06b6d4", line=dict(color="#06b6d4", width=1)), # Azzurro per ribassi di costo
-        whiskerwidth=0,       # Elimina i trattini orizzontali in cima/fondo alle ombre verticali
-        line=dict(width=1.5)  # Spessore del fusto verticale (wick)
+        increasing=dict(fillcolor="#f59e0b", line=dict(color="#f59e0b", width=1)),
+        decreasing=dict(fillcolor="#06b6d4", line=dict(color="#06b6d4", width=1)),
+        whiskerwidth=0,
+        line=dict(width=1.5)
     )
 
-    # Layout pulito con sfondo interno grigio/azzurro chiarissimo (#f8fafc) e griglie chiare nitede
     fig.update_layout(
         title="Perdita Totale dell'Intervento vs Giorno di Inizio D0 (Solo Giorni Completati al 100%)",
         yaxis_title="Perdita Totale (€)",
@@ -787,14 +776,14 @@ def plot_profit_candles(summary_scored: pd.DataFrame) -> go.Figure:
         margin=dict(l=15, r=15, t=60, b=20),
         xaxis=dict(
             type="category",
-            rangeslider=dict(visible=False), # Nasconde la barra di scorrimento finanziaria inferiore
+            rangeslider=dict(visible=False),
             gridcolor="rgba(255,255,255,1)",
         ),
         yaxis=dict(
-            gridcolor="rgba(241,245,249,1)", # Linee della griglia orizzontale nitide e leggere
+            gridcolor="rgba(241,245,249,1)",
             zeroline=False
         ),
-        plot_bgcolor="#f8fafc", # Colore di sfondo dell'area del grafico
+        plot_bgcolor="#f8fafc",
     )
     return fig
 
@@ -996,7 +985,6 @@ default_steps = pd.DataFrame(
 )
 steps_df = st.data_editor(default_steps, num_rows="dynamic", use_container_width=True, hide_index=True)
 
-# Parsing robusto delle attività
 steps: List[Step] = []
 for _, r in steps_df.iterrows():
     name = str(r.get("Step", "")).strip()
@@ -1034,7 +1022,7 @@ with st.spinner("Caricamento forecast Open‑Meteo..."):
             include_gusts=bool(include_gusts),
             timezone="auto",
         )
-    st.success("Forecast caricato da Open‑Meteo Ensemble API.")
+    st.success("Forecast caricato correttamente tramite le API di Open‑Meteo.")
 
 df["timestamp"] = pd.to_datetime(df["timestamp"])
 df = df.sort_values("timestamp").reset_index(drop=True)
@@ -1045,7 +1033,6 @@ if not wind_cols_all:
     st.error("Non ho trovato colonne wind ensemble nel dataset.")
     st.stop()
 
-# Campionamento intelligente dei membri dell'ensemble
 n_members_available = len(wind_cols_all)
 if use_all_members:
     wind_cols_use = wind_cols_all
@@ -1067,12 +1054,11 @@ forecast_end = df["timestamp"].max()
 earliest_ts = pd.Timestamp(earliest_day)
 horizon_start = max(forecast_start.normalize(), clamp_date_to_forecast(earliest_ts, forecast_start, forecast_end))
 
-# Grafici di contesto meteo/produzione (sempre visibili ed aggiornati real-time)
 st.markdown("### Grafici Meteo & Produzione Prevista")
 st.plotly_chart(plot_wind_speed_ensemble(df, wind_cols_use), use_container_width=True)
 st.plotly_chart(plot_expected_production(df, wind_cols_use), use_container_width=True)
 
-# --- CONTROLLO ED ESECUZIONE SIMULAZIONE (PULSANTE MANUALE) ---
+# --- CONTROLLO ED ESECUZIONE SIMULAZIONE ---
 all_days = pd.date_range(start=horizon_start, end=forecast_end.normalize(), freq="1D")
 
 if len(all_days) == 0:
@@ -1104,7 +1090,6 @@ st.info(f"⏱️ **Tempo stimato:** {format_time_estimate(est_sec)}  —  {len(w
 if st.session_state["sims_profit"] and st.session_state["sims_hash_profit"] != cur_hash:
     st.warning("⚠️ Parametri operativi o economici modificati. Clicca sul pulsante per ricalcolare i risultati con i nuovi valori.")
 
-# IL PULSANTE DI ESECUZIONE MANUALE
 if st.button("▶ Esegui simulazione", type="primary", use_container_width=True):
     sims = {}
     prog_bar = st.progress(0.0, text="Avvio simulazione...")
@@ -1134,7 +1119,7 @@ if st.button("▶ Esegui simulazione", type="primary", use_container_width=True)
     st.session_state["sims_hash_profit"] = cur_hash
     st.success(f"✅ Analisi completata in {time.time() - t_start:.2f} secondi.")
 
-# --- RENDERING RISULTATI (Solo se la simulazione è presente in session_state) ---
+# --- RENDERING RISULTATI ---
 if st.session_state["sims_profit"]:
     sims = st.session_state["sims_profit"]
     summary = compute_daily_summary_profit(sims)
@@ -1170,7 +1155,6 @@ if st.session_state["sims_profit"]:
         st.plotly_chart(plot_profit_candles(scored), use_container_width=True)
 
         st.markdown("### Dettaglio D0 selezionato (Gantt medio + perdite fermo)")
-        # Popoliamo il selettore di dettaglio unicamente con i giorni che hanno soddisfatto il vincolo del 100%
         valid_dates_for_detail = scored["Giorno Inizio (D0)"].tolist()
         if valid_dates_for_detail:
             selected = st.selectbox("Seleziona giorno D0 per visualizzare la distribuzione oraria", valid_dates_for_detail, key="sel_d0_detail")
