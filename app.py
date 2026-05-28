@@ -67,26 +67,62 @@ def calcola_mancata_produzione(v_vento):
 def calcola_potenza_mw(v_vento):
     return np.interp(v_vento, v_curve, p_curve) / 1000.0
 
-# --- 2. FUNZIONI DI DOWNLOAD DATI ---
-@st.cache_data(ttl=600) # Evita di riscaricare ad ogni minima modifica grafica
+# --- 2. FUNZIONI DI DOWNLOAD DATI ECONOMICHE E ADATTIVE ---
+@st.cache_data(ttl=600)
 def fetch_forecast_data(lat, lon, model_api, giorni, n_membri, max_m):
     passo = max(1, max_m // n_membri)
     membri_scelti = [i for i in range(0, max_m, passo)][:n_membri]
     
+    # Chiediamo esplicitamente sia i dati generici che quelli specifici del modello per evitare disallineamenti di Open-Meteo
     url = f"https://ensemble-api.open-meteo.com/v1/ensemble?latitude={lat}&longitude={lon}&models={model_api}&windspeed_100m=true&windgusts_10m=true&forecast_days={giorni}"
+    
     try:
         res = requests.get(url).json()
         hourly_data = res.get("hourly", {})
-        v_key = f"windspeed_100m_{model_api}" if f"windspeed_100m_{model_api}" in hourly_data else f"windspeed_10m_{model_api}"
-        g_key = f"windgusts_10m_{model_api}"
         
+        if not hourly_data:
+            st.error("L'API Open-Meteo non ha restituito dati orari. Controlla la connessione o i parametri di localizzazione.")
+            return {}
+            
+        # Individuazione dinamica delle chiavi (Risolve il problema dei grafici vuoti)
+        chiave_vento_base = ""
+        for k in hourly_data.keys():
+            if "windspeed_100m" in k and f"member{membri_scelti[0]}" in k:
+                # Trova il pattern troncando il suffisso del membro (es: "windspeed_100m_ecmwf_ifs04_member0" -> "windspeed_100m_ecmwf_ifs04_")
+                chiave_vento_base = k.split("member")[0]
+                break
+        
+        if not chiave_vento_base:
+            # Fallback a 10 metri se a 100 metri non risponde il modello
+            for k in hourly_data.keys():
+                if "windspeed_10m" in k and f"member{membri_scelti[0]}" in k:
+                    chiave_vento_base = k.split("member")[0]
+                    break
+        
+        chiave_raffica_base = ""
+        for k in hourly_data.keys():
+            if "windgusts_10m" in k and f"member{membri_scelti[0]}" in k:
+                chiave_raffica_base = k.split("member")[0]
+                break
+
+        # Se non trova chiavi complesse, usa quelle standard pulite di OpenMeteo
+        if not chiave_vento_base: chiave_vento_base = f"windspeed_100m_"
+        if not chiave_raffica_base: chiave_raffica_base = f"windgusts_10m_"
+
         time_seq = pd.to_datetime(hourly_data.get("time", []))
-        is_kmh = res.get("hourly_units", {}).get(v_key, "km/h") == "km/h"
+        
+        # Controllo unità di misura
+        unita_chiave = list(res.get("hourly_units", {}).values())
+        is_kmh = "km/h" in unita_chiave or res.get("hourly_units", {}).get(f"{chiave_vento_base}member0", "km/h") == "km/h"
         
         forecast_ensemble = {}
         for m in membri_scelti:
-            v_mem = hourly_data.get(f"{v_key}_member{m}", hourly_data.get(f"windspeed_10m_member{m}", []))
-            g_mem = hourly_data.get(f"{g_key}_member{m}", hourly_data.get(f"windgusts_10m_member{m}", []))
+            v_mem = hourly_data.get(f"{chiave_vento_base}member{m}", hourly_data.get(f"windspeed_100m_member{m}", []))
+            g_mem = hourly_data.get(f"{chiave_raffica_base}member{m}", hourly_data.get(f"windgusts_10m_member{m}", []))
+            
+            # Se la lista è vuota, estrai come fallback senza l'underscore prima del member
+            if not v_mem: v_mem = hourly_data.get(f"windspeed_100m_member{m}", hourly_data.get(f"windspeed_10m_member{m}", []))
+            if not g_mem: g_mem = hourly_data.get(f"windgusts_10m_member{m}", [])
             
             if is_kmh:
                 v_mem = [v / 3.6 for v in v_mem]
@@ -95,7 +131,7 @@ def fetch_forecast_data(lat, lon, model_api, giorni, n_membri, max_m):
             forecast_ensemble[m] = pd.DataFrame({"vento": v_mem, "raffica": g_mem}, index=time_seq)
         return forecast_ensemble
     except Exception as e:
-        st.error(f"Errore nel download del forecast meteo: {e}")
+        st.error(f"Errore critico nel download del forecast meteo: {e}")
         return {}
 
 def fetch_historical_data(lat, lon, data_d0):
@@ -116,7 +152,7 @@ def fetch_historical_data(lat, lon, data_d0):
             hourly_data = res.get("hourly", {})
             
             v_data = hourly_data.get("windspeed_100m", hourly_data.get("windspeed_10m", []))
-            g_data = hourly_data.get("wind_gusts_10m", hourly_data.get("windgusts_10m", []))
+            g_data = hourly_data.get("windgusts_10m", [])
             time_seq = pd.to_datetime(hourly_data.get("time", []))
             
             if res.get("hourly_units", {}).get("windspeed_100m", "km/h") == "km/h":
@@ -138,7 +174,7 @@ st.caption("I grafici sottostanti si aggiornano automaticamente quando modifichi
 # Eseguiamo subito la Chiamata A del Forecast (Reattiva)
 forecast_data = fetch_forecast_data(lat, lon, modelli_dict[modello_sel]["api_name"], giorni_forecast, membri_richiesti, max_m)
 
-if forecast_data:
+if forecast_data and len(forecast_data) > 0:
     # Calcolo dei profili aggregati (Medie, P10, P90 orari dell'ensemble) per il grafico live
     lista_df = list(forecast_data.values())
     index_comune = lista_df[0].index
@@ -171,9 +207,9 @@ if forecast_data:
         st.plotly_chart(fig_live_wind, use_container_width=True)
 
     with col_g2:
-        # Grafico B: Power Curve XY + Profilo Produzione Attesa oraria in contemporanea
+        # Grafico B: Power Curve XY 
         fig_live_pc = go.Figure()
-        fig_live_pc.add_trace(go.Scatter(x=v_curve, y=p_curve/1000.0, mode="lines+markers", name="Power Curve (Asse SX)", line=dict(color="green", width=2.5)))
+        fig_live_pc.add_trace(go.Scatter(x=v_curve, y=p_curve/1000.0, mode="lines+markers", name="Power Curve", line=dict(color="green", width=2.5)))
         fig_live_pc.update_layout(title="Power Curve della Turbina (Aerogeneratore da 3 MW)", xaxis_title="Velocità Vento [m/s]", yaxis_title="Potenza Nominale [MW]")
         st.plotly_chart(fig_live_pc, use_container_width=True)
 
@@ -184,6 +220,8 @@ if forecast_data:
     fig_live_prod.add_trace(go.Scatter(x=index_comune, y=produzione_media_mw, mode='lines', line=dict(color='green', width=2.5), name="Produzione Eolica Attesa [MW]"))
     fig_live_prod.update_layout(title="Profilo di Produzione Eolica Oraria Attesa H24 (Penale da Mancata Produzione)", xaxis_title="Data e Ora", yaxis_title="Potenza Istantanea [MW]")
     st.plotly_chart(fig_live_prod, use_container_width=True)
+else:
+    st.warning("⚠️ In attesa di ricevere dati validi dall'API di Open-Meteo per popolare i grafici dell'anteprima...")
 
 # --- 4. PRE-CALCOLO LIMITI SIMULAZIONE ---
 durata_teorica_ore = df_steps_input["Durata [h]"].sum()
@@ -202,7 +240,7 @@ else:
     st.info(f"⏳ **Configurazione di Calcolo:** Verranno simulate **{giorni_d0_validi} date di inizio (D0)** differenti su ciascuno dei **{membri_richiesti} membri dell'ensemble**. Tempo stimato elaborazione Monte Carlo: ~{tempo_stimato_cpu:.3f} secondi.")
 
 # --- 5. PULSANTE DI OTTIMIZZAZIONE PESANTE (STORICO + MONTE CARLO) ---
-if st.button("🚀 Avvia Ottimizzazione Economica", disabled=(giorni_d0_validi <= 0)):
+if st.button("🚀 Avvia Ottimizzazione Economica", disabled=(giorni_d0_validi <= 0 or not forecast_data)):
     with st.spinner("Scaricamento archivio storico da Open-Meteo ed elaborazione dei cicli Monte Carlo..."):
         
         # Chiamata B: Archivio Storico degli ultimi 10 anni
@@ -350,7 +388,7 @@ if st.button("🚀 Avvia Ottimizzazione Economica", disabled=(giorni_d0_validi <
             miglior_d0_sicurezza = df_risultati.loc[df_risultati["Prob Successo Forecast %"].idxmax()]
 
             # --- OUTPUT FINALE DELL'OTTIMIZZAZIONE ---
-            st.success(f"🎯 **Giorno d'Inizio Ottimiale (Minimo Costo Totale):** **{miglior_d0_economico['D0'].strftime('%d/%m/%Y')}** con un Costo Medio Atteso di **{miglior_d0_economico['Costo Medio']:,.2f} €**.")
+            st.success(f"🎯 **Giorno d'Inizio Ottimale (Minimo Costo Totale):** **{miglior_d0_economico['D0'].strftime('%d/%m/%Y')}** con un Costo Medio Atteso di **{miglior_d0_economico['Costo Medio']:,.2f} €**.")
             st.info(f"🛡️ **Giorno con Massima Sicurezza Operativa:** **{miglior_d0_sicurezza['D0'].strftime('%d/%m/%Y')}** ({miglior_d0_sicurezza['Prob Successo Forecast %']:.1f}% di completamento senza ricorrere al Monte Carlo).")
 
             # Grafico dei Costi di Ottimizzazione
