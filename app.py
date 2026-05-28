@@ -157,12 +157,17 @@ def generate_price_series(ts: pd.Series, seed: int = 7) -> np.ndarray:
     return np.round(price, 2)
 
 # -----------------------------
-# OPEN-METEO: FETCH ENSEMBLE
+# OPEN-METEO: FETCH ENSEMBLE (CORRETTA E ROBUSTA)
 # -----------------------------
 OPEN_METEO_ENSEMBLE_ENDPOINT = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
 def _extract_member_cols(hourly: dict, base_name: str) -> List[str]:
+    """
+    Cerca nel dizionario hourly tutte le chiavi associate ai membri ensemble 
+    per una determinata variabile di base (es. wind_speed_10m, wind_speed_80m, ecc.)
+    """
     keys = list(hourly.keys())
+    # Questa regex intercetta sia "wind_speed_80m_member_1" sia "wind_speed_80m_member1" o varianti con spazi/underscore
     patt = re.compile(rf"^{re.escape(base_name)}_?member[\s_]?(\d+)$")
     found = []
     for k in keys:
@@ -181,7 +186,9 @@ def fetch_open_meteo_ensemble(
     include_gusts: bool,
     timezone: str = "auto",
 ) -> pd.DataFrame:
-    hourly_vars = ["wind_speed_80m"]
+    
+    # Chiediamo sia 80m che 10m (o 100m se preferisci) per avere un fallback se ECMWF non ha gli 80m
+    hourly_vars = ["wind_speed_80m", "wind_speed_10m"]
     if include_gusts:
         hourly_vars.append("wind_gusts_10m")
 
@@ -205,20 +212,53 @@ def fetch_open_meteo_ensemble(
     times = pd.to_datetime(hourly["time"])
     df = pd.DataFrame({"timestamp": times})
 
+    # --- FALLBACK DINAMICO PER I MEMBRI DEL VENTO ---
+    # Proviamo prima a cercare i membri a 80m (ottimali per WTG)
     wind_keys = _extract_member_cols(hourly, "wind_speed_80m")
+    var_usata = "wind_speed_80m"
+    
+    # Se il modello (come ECMWF) non restituisce i membri a 80m, facciamo fallback sui 10m
     if not wind_keys:
-        raise ValueError("Non trovo membri ensemble 'wind_speed_80m_member*' nella risposta Open-Meteo.")
+        wind_keys = _extract_member_cols(hourly, "wind_speed_10m")
+        var_usata = "wind_speed_10m"
+        
+    # Se non troviamo nulla nemmeno a 10m, facciamo una ricerca generica su qualsiasi chiave contenga "_member"
+    if not wind_keys:
+        # Cerchiamo se ci sono chiavi legate al vento di qualsiasi tipo (es. a 100m o generiche)
+        chiavi_vento = [k for k in hourly.keys() if "wind_speed" in k]
+        for cv in chiavi_vento:
+            # Estraiamo la radice (es. "wind_speed_100m" dal nome completo del membro)
+            radice = cv.split("_member")[0]
+            wind_keys = _extract_member_cols(hourly, radice)
+            if wind_keys:
+                var_usata = radice
+                break
 
+    # Se dopo tutti i tentativi non troviamo traccia di membri ensemble
+    if not wind_keys:
+        raise ValueError(
+            f"Non trovo membri ensemble di tipo 'wind_speed' nella risposta Open-Meteo per il modello '{model}'. "
+            f"Chiavi ricevute dall'API: {list(hourly.keys())}"
+        )
+
+    # Popoliamo il DataFrame standardizzando il nome della colonna a 'wind_speed_80m_member_X' 
+    # per non rompere il resto dell'applicazione di simulazione
     for i, k in enumerate(wind_keys):
         df[f"wind_speed_80m_member_{i}"] = pd.to_numeric(hourly[k], errors="coerce")
 
+    # --- ESTRAZIONE RAFFICHE (GUSTS) ---
     gust_keys = _extract_member_cols(hourly, "wind_gusts_10m") if include_gusts else []
-    if include_gusts and gust_keys and len(gust_keys) == len(wind_keys):
+    if include_gusts and gust_keys:
         for i, k in enumerate(gust_keys):
-            df[f"wind_gusts_10m_member_{i}"] = pd.to_numeric(hourly[k], errors="coerce")
+            # Protezione nel caso in cui il numero di membri delle raffiche differisca da quelli del vento accelerato
+            if i < len(wind_keys):
+                df[f"wind_gusts_10m_member_{i}"] = pd.to_numeric(hourly[k], errors="coerce")
 
+    # Generiamo la serie dei prezzi orari fittizi basandoci sui timestamp estratti
     df["price_eur_mwh"] = generate_price_series(df["timestamp"])
+    
     return df
+
 
 # -----------------------------
 # MOCK DATA
