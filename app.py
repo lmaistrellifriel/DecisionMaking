@@ -659,7 +659,7 @@ def simulate_single_start_day_profit(
         "member_logs": member_logs,
     }
 
-def def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataFrame:
+def compute_daily_summary_profit(all_sims: Dict[pd.Timestamp, Dict]) -> pd.DataFrame:
     rows = []
     for d0, sim in all_sims.items():
         if sim.get("status") != "ok":
