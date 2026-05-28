@@ -194,9 +194,18 @@ if st.button("🚀 Avvia Ottimizzazione", disabled=(giorni_d0_validi <= 0)):
                             tempo_mc = historical_data[historical_data["anno"] == storico_anno_scelto].index[0]
                             delta_ore_mc = 0
                             
+                        # Forza il timestamp ad essere allineato all'ora esatta senza minuti/secondi
+                        tempo_mc = tempo_mc.floor('h')
+                        
+                        if tempo_mc not in historical_data.index:
+                            tempo_mc = historical_data[historical_data["anno"] == storico_anno_scelto].index[0]
+                            delta_ore_mc = 0
+                            
+                        # Estrazione corretta usando i nomi colonna mappati ("vento" e "raffica")
                         v_ora = historical_data.loc[tempo_mc, "vento"]
-                        g_ora = historical_data.loc[tempo_mc, "windgusts_10m"]
+                        g_ora = historical_data.loc[tempo_mc, "raffica"] 
                         is_forecast_flag = False
+                        delta_ore_mc += 1
                         delta_ore_mc += 1
                     
                     log_vento_m.append(v_ora)
