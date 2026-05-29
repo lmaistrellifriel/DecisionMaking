@@ -194,10 +194,14 @@ def fetch_open_meteo_ensemble(
     latitude: float,
     longitude: float,
     model: str,
-    forecast_days: int,
     include_gusts: bool,
     timezone: str = "auto",
 ) -> pd.DataFrame:
+    """
+    MODIFICA UTENTE: Rimosso il parametro 'forecast_days'. I dati di OpenMeteo NON vengono più troncati.
+    Viene fatta esplicita richiesta per il massimo orizzonte temporale nativo consentito dall'API (16 giorni),
+    garantendo che eventuali estensioni future (es. Monte Carlo) partano unicamente dal termine del forecast reale.
+    """
     hourly_vars = ["wind_speed_80m"]
     if include_gusts:
         hourly_vars.append("wind_gusts_10m")
@@ -206,7 +210,7 @@ def fetch_open_meteo_ensemble(
         "latitude": latitude,
         "longitude": longitude,
         "models": model,
-        "forecast_days": int(forecast_days),
+        "forecast_days": 16,  # Richiede sempre l'orizzonte massimo nativo di OpenMeteo
         "hourly": ",".join(hourly_vars),
         "timezone": timezone,
     }
@@ -247,7 +251,7 @@ def fetch_open_meteo_ensemble(
 
 def generate_mock_open_meteo_ensemble(
     start: str = None,
-    days: int = 10,
+    days: int = 16,  # MODIFICA UTENTE: Portato a 16 giorni di default per allinearsi al comportamento reale
     n_members: int = 30,
     seed: int = 42,
     include_gusts: bool = True,
@@ -297,104 +301,24 @@ def detect_members(df: pd.DataFrame) -> Tuple[List[str], Optional[List[str]]]:
 
 
 # -----------------------------
-# MONTE CARLO EXTENSION GENERATOR
-# -----------------------------
-def extend_ensemble_monte_carlo(df: pd.DataFrame, wind_cols: List[str], gust_cols: Optional[List[str]], extension_days: int = 7) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-    
-    forecast_end = df["timestamp"].max()
-    ext_idx = pd.date_range(start=forecast_end + pd.Timedelta(hours=1), periods=extension_days * 24, freq="1h")
-    df_ext = pd.DataFrame({"timestamp": ext_idx})
-    df_ext["price_eur_mwh"] = generate_price_series(df_ext["timestamp"], seed=99)
-    
-    rng = np.random.default_rng(12345)
-    phi = 0.92  # Autocorrelation coefficient for hourly weather trends
-    
-    for m, wind_col in enumerate(wind_cols):
-        series = df[wind_col].dropna().to_numpy(dtype=float)
-        if len(series) == 0:
-            mean_w, std_w = 7.5, 2.5
-        else:
-            mean_w = float(np.mean(series))
-            std_w = float(np.std(series))
-            
-        sigma_res = std_w * math.sqrt(1 - phi**2) if std_w > 0 else 0.5
-        sigma_res = max(0.2, sigma_res)
-        
-        last_val = series[-1] if len(series) > 0 else mean_w
-        ext_values = []
-        
-        for _ in range(len(df_ext)):
-            # AR(1) mean-reverting process matching specific member's profile
-            next_val = mean_w + phi * (last_val - mean_w) + rng.normal(0, sigma_res)
-            next_val = max(0.0, min(30.0, next_val))
-            ext_values.append(next_val)
-            last_val = next_val
-            
-        df_ext[wind_col] = np.round(ext_values, 2)
-        
-        if gust_cols and m < len(gust_cols):
-            gust_col = gust_cols[m]
-            gust_series = df[gust_col].dropna().to_numpy(dtype=float)
-            if len(gust_series) == len(series):
-                diffs = gust_series - series
-                mean_diff = max(1.0, float(np.mean(diffs)))
-                std_diff = max(0.5, float(np.std(diffs)))
-            else:
-                mean_diff, std_diff = 3.5, 1.0
-                
-            gust_vals = []
-            for w_val in ext_values:
-                g_val = w_val + max(0.5, mean_diff + rng.normal(0, std_diff * 0.5))
-                g_val = min(40.0, g_val)
-                gust_vals.append(g_val)
-            df_ext[gust_col] = np.round(gust_vals, 2)
-            
-    return df_ext
-
-
-# -----------------------------
 # PLOTS: wind & production
 # -----------------------------
-def plot_wind_speed_ensemble(df_base: pd.DataFrame, wind_cols: List[str], df_ext: Optional[pd.DataFrame] = None) -> go.Figure:
+def plot_wind_speed_ensemble(df_view: pd.DataFrame, wind_cols: List[str]) -> go.Figure:
+    wind_mat = df_view[wind_cols].to_numpy(dtype=float)
+    p10 = np.percentile(wind_mat, 10, axis=1)
+    p90 = np.percentile(wind_mat, 90, axis=1)
+    mean = np.mean(wind_mat, axis=1)
+
     fig = go.Figure()
-    
-    # 1. Base OpenMeteo Trace
-    if not df_base.empty:
-        wind_mat = df_base[wind_cols].to_numpy(dtype=float)
-        p10 = np.percentile(wind_mat, 10, axis=1)
-        p90 = np.percentile(wind_mat, 90, axis=1)
-        mean = np.mean(wind_mat, axis=1)
-
-        fig.add_trace(go.Scatter(x=df_base["timestamp"], y=p90, mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scatter(
-            x=df_base["timestamp"], y=p10, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(14,165,233,0.18)", name="P10–P90 (OpenMeteo)",
-        ))
-        fig.add_trace(go.Scatter(
-            x=df_base["timestamp"], y=mean, mode="lines",
-            line=dict(color="rgba(14,165,233,1)", width=2.5), name="Media (OpenMeteo)",
-        ))
-        
-    # 2. Monte Carlo Extension Trace (Styled differently)
-    if df_ext is not None and not df_ext.empty:
-        df_ext_conn = pd.concat([df_base.tail(1), df_ext], ignore_index=True) if not df_base.empty else df_ext
-        wind_mat_ext = df_ext_conn[wind_cols].to_numpy(dtype=float)
-        p10_ext = np.percentile(wind_mat_ext, 10, axis=1)
-        p90_ext = np.percentile(wind_mat_ext, 90, axis=1)
-        mean_ext = np.mean(wind_mat_ext, axis=1)
-        
-        fig.add_trace(go.Scatter(x=df_ext_conn["timestamp"], y=p90_ext, mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scatter(
-            x=df_ext_conn["timestamp"], y=p10_ext, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(249,115,22,0.15)", name="P10–P90 (Monte Carlo)",
-        ))
-        fig.add_trace(go.Scatter(
-            x=df_ext_conn["timestamp"], y=mean_ext, mode="lines",
-            line=dict(color="rgba(249,115,22,1)", width=2.5), name="Media (Monte Carlo)",
-        ))
-
+    fig.add_trace(go.Scatter(x=df_view["timestamp"], y=p90, mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(
+        x=df_view["timestamp"], y=p10, mode="lines", line=dict(width=0),
+        fill="tonexty", fillcolor="rgba(14,165,233,0.18)", name="P10–P90",
+    ))
+    fig.add_trace(go.Scatter(
+        x=df_view["timestamp"], y=mean, mode="lines",
+        line=dict(color="rgba(14,165,233,1)", width=2.5), name="Media",
+    ))
     fig.update_layout(
         title="Velocità vento prevista [m/s] (ensemble)",
         xaxis_title="Tempo",
@@ -407,47 +331,25 @@ def plot_wind_speed_ensemble(df_base: pd.DataFrame, wind_cols: List[str], df_ext
     return fig
 
 
-def plot_expected_production(df_base: pd.DataFrame, wind_cols: List[str], df_ext: Optional[pd.DataFrame] = None) -> go.Figure:
-    fig = go.Figure()
+def plot_expected_production(df_view: pd.DataFrame, wind_cols: List[str]) -> go.Figure:
+    wind_mat = df_view[wind_cols].to_numpy(dtype=float)
     v_power = np.vectorize(power_curve_mw)
-    
-    # 1. Base OpenMeteo Trace
-    if not df_base.empty:
-        wind_mat = df_base[wind_cols].to_numpy(dtype=float)
-        power_mat = v_power(wind_mat)
-        p10 = np.percentile(power_mat, 10, axis=1)
-        p90 = np.percentile(power_mat, 90, axis=1)
-        mean = np.mean(power_mat, axis=1)
+    power_mat = v_power(wind_mat)
 
-        fig.add_trace(go.Scatter(x=df_base["timestamp"], y=p90, mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scatter(
-            x=df_base["timestamp"], y=p10, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(59,130,246,0.18)", name="P10–P90 (OpenMeteo)",
-        ))
-        fig.add_trace(go.Scatter(
-            x=df_base["timestamp"], y=mean, mode="lines",
-            line=dict(color="rgba(59,130,246,1)", width=2.5), name="Media (OpenMeteo)",
-        ))
-        
-    # 2. Monte Carlo Extension Trace (Styled differently)
-    if df_ext is not None and not df_ext.empty:
-        df_ext_conn = pd.concat([df_base.tail(1), df_ext], ignore_index=True) if not df_base.empty else df_ext
-        wind_mat_ext = df_ext_conn[wind_cols].to_numpy(dtype=float)
-        power_mat_ext = v_power(wind_mat_ext)
-        p10_ext = np.percentile(power_mat_ext, 10, axis=1)
-        p90_ext = np.percentile(power_mat_ext, 90, axis=1)
-        mean_ext = np.mean(power_mat_ext, axis=1)
-        
-        fig.add_trace(go.Scatter(x=df_ext_conn["timestamp"], y=p90_ext, mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scatter(
-            x=df_ext_conn["timestamp"], y=p10_ext, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(168,85,247,0.15)", name="P10–P90 (Monte Carlo)",
-        ))
-        fig.add_trace(go.Scatter(
-            x=df_ext_conn["timestamp"], y=mean_ext, mode="lines",
-            line=dict(color="rgba(168,85,247,1)", width=2.5), name="Media (Monte Carlo)",
-        ))
+    p10 = np.percentile(power_mat, 10, axis=1)
+    p90 = np.percentile(power_mat, 90, axis=1)
+    mean = np.mean(power_mat, axis=1)
 
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_view["timestamp"], y=p90, mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(
+        x=df_view["timestamp"], y=p10, mode="lines", line=dict(width=0),
+        fill="tonexty", fillcolor="rgba(59,130,246,0.18)", name="P10–P90",
+    ))
+    fig.add_trace(go.Scatter(
+        x=df_view["timestamp"], y=mean, mode="lines",
+        line=dict(color="rgba(59,130,246,1)", width=2.5), name="Media",
+    ))
     fig.update_layout(
         title="Produzione prevista [MW] (ensemble + power curve)",
         xaxis_title="Tempo",
@@ -576,11 +478,13 @@ def simulate_single_start_day_cost(
             w = df.at[idx, wind_col]
             g = df.at[idx, gust_col] if gust_col is not None else np.nan
 
+            # turbina OFF -> perdita fatturato
             p_mw = power_curve_mw(w, rated_mw=rated_mw)
             price = float(df.at[idx, "price_eur_mwh"])
             loss_eur = p_mw * price
             lost_revenue += loss_eur
 
+            # crane look-ahead presence
             crane_present = any(s.requires_crane for s in steps[step_i:])
             c_cost = 0.0
 
@@ -681,6 +585,16 @@ def compute_daily_summary_cost(all_sims: Dict[pd.Timestamp, Dict], structural_in
 
 
 def choose_optimal_day_cost(summary: pd.DataFrame, last_possible_start: Optional[pd.Timestamp], risk_aversion: float = 0.7) -> Tuple[Optional[pd.Timestamp], pd.DataFrame, str]:
+    """
+    MINIMIZZAZIONE:
+    Score = CostoMedio + risk_aversion*Spread
+
+    "Nessun D0 ottimo" SOLO se:
+      - tra i candidati (<= last_possible_start) la Probabilità Successo massima è 0%
+      - oppure non esistono candidati perché earliest_day è oltre la finestra che consente completamento.
+    Inoltre:
+      - mai scegliere oltre last_possible_start (se esiste)
+    """
     s = summary.copy()
     if s.empty:
         return None, s, "Nessun dato"
@@ -797,7 +711,10 @@ with st.sidebar:
     latitude = st.number_input("Latitudine", value=41.5)
     longitude = st.number_input("Longitudine", value=15.2)
     model = st.selectbox("Modello", options=["gfs_seamless", "icon_seamless", "ecmwf_ifs04"])
-    forecast_days = st.slider("Giorni forecast (richiesti)", 3, 16, 10)
+    
+    # MODIFICA UTENTE: Rimosso l'input slider 'forecast_days'. I dati reali di OpenMeteo non vengono 
+    # mai troncati arbitrariamente prima della fine naturale del forecast del modello scelto.
+    
     include_gusts = st.toggle("Usa raffiche", value=True)
 
     st.divider()
@@ -836,6 +753,7 @@ params = CraneParams(
 
 # Steps table + Richiede Gru
 st.subheader("Pianificazione Attività (step)")
+
 default_steps = pd.DataFrame({
     "Step": ["Step 1", "Step 2", "Step 3"],
     "Durata [h]": [8.0, 8.0, 8.0],
@@ -844,6 +762,7 @@ default_steps = pd.DataFrame({
     "Finestra minima consecutiva [h]": [3.0, 3.0, 3.0],
     "Richiede Gru": [True, True, True],
 })
+
 steps_df = st.data_editor(default_steps, num_rows="dynamic", use_container_width=True, hide_index=True)
 
 steps: List[Step] = []
@@ -855,12 +774,12 @@ for _, r in steps_df.iterrows():
     gt_raw = r.get("Gust Threshold [m/s] (opzionale)")
     gt = None if (gt_raw is None or pd.isna(gt_raw)) else safe_float(gt_raw)
     req = safe_bool(r.get("Richiede Gru"), default=True)
-    
+
     if name == "" and dur is None and wt is None:
         continue
     if dur is None or wt is None or dur <= 0 or wt <= 0:
         continue
-        
+
     steps.append(Step(
         name=name if name else "Step",
         duration_h=float(dur),
@@ -879,23 +798,27 @@ required_work_h = float(sum(s.duration_h for s in steps))
 # Load meteo
 with st.spinner("Caricamento dati meteo..."):
     if use_mock:
-        df = generate_mock_open_meteo_ensemble(days=int(forecast_days), n_members=30, include_gusts=include_gusts)
+        # MODIFICA UTENTE: Rimosso 'forecast_days', forzato a 16 giorni fissi nel generatore mock
+        df = generate_mock_open_meteo_ensemble(days=16, n_members=30, include_gusts=include_gusts)
         st.info("Usando Mock Data (debug).")
     else:
-        df = fetch_open_meteo_ensemble(latitude, longitude, model, forecast_days, include_gusts)
-        
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
+        # MODIFICA UTENTE: Rimossa la variabile 'forecast_days' dalla firma della funzione
+        df = fetch_open_meteo_ensemble(latitude, longitude, model, include_gusts)
+
+df["timestamp"] = pd.to_datetime(df["timestamp"])
+df = df.sort_values("timestamp").reset_index(drop=True)
 
 # --- ORIZZONTE REALE (MODEL-DEPENDENT) ---
 forecast_start = df["timestamp"].min()
 forecast_end = df["timestamp"].max()
 actual_forecast_days = int((forecast_end.normalize() - forecast_start.normalize()).days) + 1
 
-if actual_forecast_days < int(forecast_days) and not use_mock:
+# MODIFICA UTENTE: Riadattato l'avviso. Non fa più riferimento ai giorni scelti dall'utente, ma
+# segnala la durata reale recuperata rispetto al limite teorico standard di 16 giorni.
+if actual_forecast_days < 16 and not use_mock:
     st.warning(
         f"⚠️ Il modello selezionato ha restituito {actual_forecast_days} giorni di forecast "
-        f"(richiesti: {int(forecast_days)}). Verrà usato SOLO l'orizzonte reale disponibile."
+        f"(massimo teorico standard: 16 giorni). Verrà usato SOLO l'orizzonte reale disponibile."
     )
 st.caption(
     f"Orizzonte reale disponibile: {forecast_start.strftime('%d/%m/%Y %H:%M')} → "
@@ -910,78 +833,54 @@ if not wind_cols_all:
 wind_cols_use = wind_cols_all if use_all_members else wind_cols_all[:min(len(wind_cols_all), int(n_members_input))]
 gust_cols_use = gust_cols_all[:len(wind_cols_use)] if gust_cols_all else None
 
+# Orizzonte di analisi parte dalla data minima (o inizio forecast reale)
 horizon_start = max(forecast_start.normalize(), pd.Timestamp(earliest_day))
+
+# ALL D0 days fino all'ultimo giorno REALE disponibile
 all_days = pd.date_range(start=horizon_start.normalize(), end=forecast_end.normalize(), freq="1D").to_list()
 if not all_days:
     st.error("Nessun giorno D0 disponibile nell'orizzonte reale.")
     st.stop()
 
-# --- INITIALIZE SESSION STATE ---
-if "sims_cost" not in st.session_state:
-    st.session_state["sims_cost"] = None
-if "sims_hash_cost" not in st.session_state:
-    st.session_state["sims_hash_cost"] = None
-if "df_extension" not in st.session_state:
-    st.session_state["df_extension"] = None
-
-# Current configuration fingerprint hash
-cur_hash = hashlib.md5(json.dumps({
-    "m": len(wind_cols_use),
-    "d": [str(x.date()) for x in all_days],
-    "steps": [(s.name, s.duration_h, s.wind_thr, s.gust_thr, s.min_seq_h, s.requires_crane) for s in steps],
-    "p": [mob_demob, op_std, op_fest, standby, shift_start, shift_end],
-    "ra": risk_aversion,
-    "hs": str(horizon_start),
-    "fe": str(forecast_end),
-}, sort_keys=True).encode()).hexdigest()
-
-# Handle parameters variation
-if st.session_state["sims_cost"] is not None and st.session_state["sims_hash_cost"] != cur_hash:
-    st.warning("⚠️ Parametri cambiati dall'ultima esecuzione. Premi il pulsante per aggiornare.")
-    df_ext_to_plot = None
-    df_active = df
-else:
-    df_ext_to_plot = st.session_state["df_extension"]
-    if df_ext_to_plot is not None:
-        df_active = pd.concat([df, df_ext_to_plot], ignore_index=True).sort_values("timestamp").reset_index(drop=True)
-    else:
-        df_active = df
-
-# Always-visible plots (updates with OpenMeteo base and links Monte Carlo extension conditionally)
+# Always-visible plots (aggiornano con l'orizzonte reale)
 st.subheader("Contesto meteo & produzione (sempre visibile)")
-df_view = df[(df["timestamp"] >= horizon_start) & (df["timestamp"] <= forecast_end)].copy()
+preview_end = min(forecast_end, horizon_start + pd.Timedelta(days=5) - pd.Timedelta(seconds=1))
+df_view = df[(df["timestamp"] >= horizon_start) & (df["timestamp"] <= preview_end)].copy()
 
 c1, c2 = st.columns([1, 1])
 with c1:
     st.plotly_chart(plot_power_curve(), use_container_width=True)
 with c2:
-    st.plotly_chart(plot_wind_speed_ensemble(df_view, wind_cols_use, df_ext_to_plot), use_container_width=True)
-st.plotly_chart(plot_expected_production(df_view, wind_cols_use, df_ext_to_plot), use_container_width=True)
+    st.plotly_chart(plot_wind_speed_ensemble(df_view, wind_cols_use), use_container_width=True)
+st.plotly_chart(plot_expected_production(df_view, wind_cols_use), use_container_width=True)
 
-# Structural infeasible map + last possible start (evaluated using df_active)
+# Structural infeasible map + last possible start (based on forecast_end reale)
 structural_infeasible = {}
 available_work_h_map = {}
+
 for d0 in all_days:
     d0_ts = pd.Timestamp(d0.date())
-    idx0 = int(df_active["timestamp"].searchsorted(d0_ts))
-    if idx0 >= len(df_active):
+    idx0 = int(df["timestamp"].searchsorted(d0_ts))
+    if idx0 >= len(df):
         structural_infeasible[pd.Timestamp(d0)] = True
         available_work_h_map[pd.Timestamp(d0)] = 0
         continue
-    d0_aligned = df_active.at[idx0, "timestamp"]
-    avail = count_remaining_work_hours(df_active, d0_aligned, params)
+    d0_aligned = df.at[idx0, "timestamp"]
+    avail = count_remaining_work_hours(df, d0_aligned, params)
     available_work_h_map[pd.Timestamp(d0)] = avail
     structural_infeasible[pd.Timestamp(d0)] = (avail < required_work_h)
 
 feasible_days_only = [pd.Timestamp(d) for d in all_days if not structural_infeasible.get(pd.Timestamp(d), False)]
 last_possible_start = pd.Timestamp(feasible_days_only[-1]) if feasible_days_only else None
+
 if last_possible_start is not None:
-    st.caption(f"Ultimo D0 possibile (ore turno sufficienti): {last_possible_start.date()}")
+    st.caption(f"Ultimo D0 possibile (ore turno sufficienti fino a fine forecast reale): {last_possible_start.date()}")
 else:
-    st.caption("Ultimo D0 possibile: nessuno (ore turno insufficienti)")
+    st.caption("Ultimo D0 possibile: nessuno (ore turno insufficienti nell’orizzonte reale)")
 
 # Time estimate + run
 st.subheader("Simulazione stocastica (Costi totali)")
+
 horizon_hours = int((forecast_end - horizon_start).total_seconds() / 3600) + 1
 est_sec = heuristic_estimate_seconds(len(wind_cols_use), len(all_days), horizon_hours, required_work_h)
 
@@ -992,85 +891,124 @@ m3.metric("Orizzonte (ore)", horizon_hours)
 m4.metric("Simulazioni totali", len(all_days) * len(wind_cols_use))
 st.info(f"⏱️ Tempo stimato: {format_time_estimate(est_sec)} ({len(wind_cols_use)} membri × {len(all_days)} giorni)")
 
+cur_hash = hashlib.md5(json.dumps({
+    "m": len(wind_cols_use),
+    "d": [str(x.date()) for x in all_days],
+    "steps": [(s.name, s.duration_h, s.wind_thr, s.gust_thr, s.min_seq_h, s.requires_crane) for s in steps],
+    "p": [mob_demob, op_std, op_fest, standby, shift_start, shift_end],
+    "ra": risk_aversion,
+    "hs": str(horizon_start),
+    "fe": str(forecast_end),
+}, sort_keys=True).encode()).hexdigest()
+
+if "sims_cost" not in st.session_state:
+    st.session_state["sims_cost"] = None
+if "sims_hash_cost" not in st.session_state:
+    st.session_state["sims_hash_cost"] = None
+
+if st.session_state["sims_cost"] is not None and st.session_state["sims_hash_cost"] != cur_hash:
+    st.warning("⚠️ Parametri cambiati dall'ultima esecuzione. Premi il pulsante per aggiornare.")
+
 run_clicked = st.button("▶ Esegui simulazione", type="primary", use_container_width=True, key="btn_run_cost_main")
 
 if run_clicked:
-    with st.spinner("Generazione estensione Monte Carlo e calcolo simulazione..."):
-        # 1. Generate Monte Carlo Weather Extension (7 Days ahead)
-        df_ext = extend_ensemble_monte_carlo(df, wind_cols_all, gust_cols_all, extension_days=7)
-        st.session_state["df_extension"] = df_ext
-        
-        # 2. Complete active simulation horizon
-        df_sim = pd.concat([df, df_ext], ignore_index=True).sort_values("timestamp").reset_index(drop=True)
-        
-        sims = {}
-        prog = st.progress(0.0, text="Avvio...")
-        for i, d0 in enumerate(all_days):
-            sims[pd.Timestamp(d0)] = simulate_single_start_day_cost(
-                df=df_sim,
-                start_day=pd.Timestamp(d0),
-                wind_cols=wind_cols_use,
-                gust_cols=gust_cols_use,
-                steps=steps,
-                params=params
-            )
-            prog.progress((i + 1) / len(all_days), text=f"D0 {i+1}/{len(all_days)}")
-        prog.empty()
-        
-        st.session_state["sims_cost"] = sims
-        st.session_state["sims_hash_cost"] = cur_hash
-        st.rerun()
+    sims = {}
+    prog = st.progress(0.0, text="Avvio...")
+    t_start = time.perf_counter()
+    for i, d0 in enumerate(all_days):
+        sims[pd.Timestamp(d0)] = simulate_single_start_day_cost(
+            df=df,
+            start_day=pd.Timestamp(d0),
+            wind_cols=wind_cols_use,
+            gust_cols=gust_cols_use,
+            steps=steps,
+            params=params
+        )
+        prog.progress((i + 1) / len(all_days), text=f"D0 {i+1}/{len(all_days)}")
+    prog.empty()
+    st.session_state["sims_cost"] = sims
+    st.session_state["sims_hash_cost"] = cur_hash
+    st.success(f"✅ Simulazione completata in {format_time_estimate(time.perf_counter() - t_start)}.")
+
+if st.session_state["sims_cost"] is None:
+    st.info("👆 Premi **Esegui simulazione** per ottenere i risultati.")
+    st.stop()
 
 sims = st.session_state["sims_cost"]
-if sims:
-    st.success(f"Simulazione completata con successo!")
-    
-    summary_df = compute_daily_summary_cost(sims, structural_infeasible)
-    best_day, summary_scored, err_msg = choose_optimal_day_cost(summary_df, last_possible_start, risk_aversion)
-    
-    if err_msg:
-        st.error(f"❌ Errore nella selezione del giorno ottimo: {err_msg}")
-        plot_df = summary_df[~summary_df["Strutturalmente impossibile"]]
-        if not plot_df.empty:
-            st.plotly_chart(plot_cost_candles(plot_df), use_container_width=True)
-    else:
-        st.subheader("🏆 Risultato Ottimizzazione")
-        best_row = summary_scored[summary_scored["Giorno Inizio (D0)"] == best_day.date()].iloc[0]
-        
-        cols = st.columns(4)
-        cols[0].metric("Miglior Giorno D0", str(best_day.date()))
-        cols[1].metric("Costo Medio Atteso", f"{best_row['Costo Medio €']:,.2f} €".replace(",", "X").replace(".", ",").replace("X", "."))
-        cols[2].metric("Probabilità Successo", f"{best_row['Probabilità Successo (%)']:.1f} %")
-        cols[3].metric("Rischio (Spread P90-P10)", f"{best_row['Spread (P90-P10) €']:,.2f} €".replace(",", "X").replace(".", ",").replace("X", "."))
-        
-        plot_df = summary_scored[~summary_scored["Strutturalmente impossibile"]]
-        st.plotly_chart(plot_cost_candles(plot_df), use_container_width=True)
-        
-    st.subheader("Dettaglio D0 selezionato (anche se non plottabile nel grafico a candele)")
-    selected = st.selectbox("Seleziona D0", [d.date() for d in all_days], key="sel_d0_detail")
-    sim_sel = sims.get(pd.Timestamp(selected))
-    
-    sel_ts = pd.Timestamp(selected)
-    sel_infeasible = bool(structural_infeasible.get(sel_ts, False))
-    sel_avail = available_work_h_map.get(sel_ts, 0)
-    
-    st.caption(
-        f"D0 selezionato: {'STRUTTURALMENTE IMPOSSIBILE' if sel_infeasible else 'strutturalmente completabile'} "
-        f"(ore turno disponibili: {sel_avail} vs richieste: {required_work_h:.0f})"
-    )
-    
-    if sim_sel and sim_sel.get("status") == "ok":
-        mr = sim_sel["member_results"]
-        cost_arr = mr["total_cost_eur"].to_numpy(dtype=float)
-        success_prob = 100.0 * float(np.mean(~mr["partial"].to_numpy(dtype=bool))) if len(mr) else 0.0
-        
-        dcols = st.columns(4)
-        dcols[0].metric("Probabilità successo", f"{success_prob:.1f} %")
-        dcols[1].metric("Costo Medio", f"{np.mean(cost_arr):,.2f} €".replace(",", "X").replace(".", ",").replace("X", "."))
-        dcols[2].metric("Costo P10 (Min)", f"{safe_percentile(cost_arr, 10):,.2f} €".replace(",", "X").replace(".", ",").replace("X", "."))
-        dcols[3].metric("Costo P90 (Max)", f"{safe_percentile(cost_arr, 90):,.2f} €".replace(",", "X").replace(".", ",").replace("X", "."))
-        
-        st.subheader("Analisi Temporale D0 Selezionato (Gantt Medio)")
-        frac = aggregate_gantt(sim_sel["member_logs"])
-        if not frac.empty:
-            st.plotly_chart(plot_gantt_fraction(frac), use_container_width=True)
+summary = compute_daily_summary_cost(sims, structural_infeasible)
+best_d0, scored, reason_none = choose_optimal_day_cost(summary, last_possible_start, risk_aversion=risk_aversion)
+
+st.header("Risultati (Costi totali + Probabilità di completamento)")
+
+c1, c2, c3, c4 = st.columns(4)
+if best_d0 is None:
+    c1.metric("Miglior D0", "Nessun D0 ottimo")
+    c2.metric("Motivo", reason_none if reason_none else "n.d.")
+    c3.metric("Ore richieste", f"{required_work_h:.0f} h turno")
+    c4.metric("Ultimo D0 possibile", str(last_possible_start.date()) if last_possible_start is not None else "Nessuno")
+else:
+    rb = scored[scored["Giorno Inizio (D0)"] == best_d0.date()].iloc[0]
+    c1.metric("Miglior D0 (min costo medio)", best_d0.strftime("%d/%m/%Y"))
+    c2.metric("Costo medio atteso", f"{rb['Costo Medio €']:,.0f} €")
+    c3.metric("Probabilità successo", f"{rb['Probabilità Successo (%)']:.1f} %")
+    c4.metric("Ultimo D0 possibile", str(last_possible_start.date()) if last_possible_start is not None else "Nessuno")
+
+st.subheader("Tabella completa (tutti i D0 simulati, formattazione uniforme)")
+st.dataframe(
+    scored[[
+        "Giorno Inizio (D0)",
+        "Probabilità Successo (%)",
+        "Costo P10 €",
+        "Costo Medio €",
+        "Costo P90 €",
+        "Spread (P90-P10) €",
+        "Strutturalmente impossibile",
+    ]].style.format({
+        "Probabilità Successo (%)": "{:.1f}",
+        "Costo P10 €": "{:,.0f}",
+        "Costo Medio €": "{:,.0f}",
+        "Costo P90 €": "{:,.0f}",
+        "Spread (P90-P10) €": "{:,.0f}",
+    }),
+    use_container_width=True,
+    hide_index=True
+)
+
+st.subheader("Costo totale vs D0 (grafico a candele: esclusi solo i D0 strutturalmente impossibili)")
+plot_df = scored[~scored["Strutturalmente impossibile"]].copy()
+if plot_df.empty:
+    st.warning("Nessun D0 è plottabile: tutti i D0 risultano strutturalmente impossibili (ore turno insufficienti).")
+else:
+    st.plotly_chart(plot_cost_candles(plot_df), use_container_width=True)
+
+st.subheader("Dettaglio D0 selezionato (anche se non plottabile nel grafico a candele)")
+selected = st.selectbox("Seleziona D0", [d.date() for d in all_days], key="sel_d0_detail")
+sim_sel = sims.get(pd.Timestamp(selected))
+
+sel_ts = pd.Timestamp(selected)
+sel_infeasible = bool(structural_infeasible.get(sel_ts, False))
+sel_avail = available_work_h_map.get(sel_ts, 0)
+
+st.caption(
+    f"D0 selezionato: {'STRUTTURALMENTE IMPOSSIBILE' if sel_infeasible else 'strutturalmente completabile'} "
+    f"(ore turno disponibili: {sel_avail} vs richieste: {required_work_h:.0f})"
+)
+
+if sim_sel and sim_sel.get("status") == "ok":
+    mr = sim_sel["member_results"]
+    cost_arr = mr["total_cost_eur"].to_numpy(dtype=float)
+    success_prob = 100.0 * float(np.mean(~mr["partial"].to_numpy(dtype=bool))) if len(mr) else 0.0
+
+    dcols = st.columns(4)
+    dcols[0].metric("Probabilità successo", f"{success_prob:.1f} %")
+    dcols[1].metric("Costo medio", f"{np.nanmean(cost_arr):,.0f} €")
+    dcols[2].metric("Costo P10", f"{np.percentile(cost_arr, 10):,.0f} €")
+    dcols[3].metric("Costo P90", f"{np.percentile(cost_arr, 90):,.0f} €")
+
+    frac = aggregate_gantt(sim_sel["member_logs"])
+    if not frac.empty:
+        st.plotly_chart(plot_gantt_fraction(frac), use_container_width=True)
+else:
+    st.info("Nessun dettaglio disponibile per il D0 selezionato.")
+
+st.caption("✅ Avvio: `streamlit run app.py`")
